@@ -1,0 +1,13 @@
+tesoreria:
+  input:
+    required_columns: ["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS"]
+  rules:
+    business_day_shift: "next"   # next | previous
+    default_bank_lag_business_days: 1
+remesas:
+  fincas:
+    day_of_month: 25
+    applies_to: "mes_prestado"
+  inmo:
+    day_of_month: 3
+    applies_to: "mes_siguiente"
