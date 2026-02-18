@@ -67,7 +67,6 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     missing = [c for c in MIN_REQUIRED if c not in df.columns]
     if missing:
         raise ValueError(f"Faltan columnas requeridas: {missing}. Columnas detectadas: {list(df.columns)}")
-
     if "IMPORTE" not in df.columns:
         raise ValueError(f"Falta columna requerida: 'IMPORTE'. Columnas detectadas: {list(df.columns)}")
 
@@ -219,15 +218,13 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 d = d + pd.Timedelta(days=7)
             continue
 
-        # PERIODICIDADES POR MESES (anclado a FECHA_FIJA)
+        # PERIODICIDADES POR MESES (anclado, y día anclado)
         if periodicidad in ("MENSUAL", "BIMESTRAL", "BIMENSUAL", "TRIMESTRAL", "SEMESTRAL"):
             step = months_step_from_periodicidad(periodicidad)
 
-            # base_date: ancla temporal
             if not pd.isna(r.get("FECHA_FIJA")):
                 base_date = pd.Timestamp(r["FECHA_FIJA"]).normalize()
             else:
-                # fallback: si no hay fecha fija, usamos DIA_MES dentro del mes de start_date
                 day = r.get("DIA_MES")
                 if not day or pd.isna(day):
                     continue
@@ -235,7 +232,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
                 base_date = pd.Timestamp(year=y, month=m, day=min(int(day), int(last_day))).normalize()
 
-            anchor_day = base_date.day  # <-- CLAVE: siempre el mismo día
+            anchor_day = base_date.day
 
             current = base_date
             while current <= end_date:
@@ -244,12 +241,10 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 if regla == "DIA_MES":
                     last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
                     d = pd.Timestamp(year=y, month=m, day=min(int(anchor_day), int(last_day))).normalize()
-
                 elif regla == "ULTIMO_HABIL":
                     d = pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)
                     d = next_business_day(d) if d.weekday() >= 5 else d
                     d = d.normalize()
-
                 elif regla == "FECHA_FIJA":
                     last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
                     d = pd.Timestamp(year=y, month=m, day=min(int(anchor_day), int(last_day))).normalize()
@@ -265,7 +260,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
 
             continue
 
-        # si no se reconoce periodicidad, no generamos
         continue
 
     if not rows:
@@ -387,9 +381,7 @@ if generated.empty:
     st.dataframe(catalog.head(50), use_container_width=True)
     st.stop()
 
-# -----------------------------
 # Filtros
-# -----------------------------
 st.sidebar.header("Filtros")
 deptos = sorted(generated["DEPARTAMENTO"].dropna().unique().tolist())
 tipos = sorted(generated["TIPO"].dropna().unique().tolist())
@@ -405,6 +397,25 @@ filtered = generated[
 filtered = filtered.sort_values("FECHA").reset_index(drop=True)
 consolidado = compute_balance(filtered, float(saldo_hoy))
 
+# Insertar fila inicial tipo Excel: SALDO BANCOS TOTAL
+base_row = pd.DataFrame([{
+    "FECHA": start_ts,
+    "CONCEPTO": "SALDO BANCOS TOTAL",
+    "TIPO": "SALDO",
+    "DEPARTAMENTO": "",
+    "IMPORTE": 0.0,
+    "NATURALEZA": "SALDO",
+    "COBROS": 0.0,
+    "PAGOS": 0.0,
+    "NETO": 0.0,
+    "SALDO": float(saldo_hoy)
+}])
+
+consolidado2 = pd.concat([base_row, consolidado], ignore_index=True)
+consolidado2["_ORD"] = 1
+consolidado2.loc[0, "_ORD"] = 0
+consolidado2 = consolidado2.sort_values(["FECHA", "_ORD"]).drop(columns=["_ORD"]).reset_index(drop=True)
+
 # -----------------------------
 # Dashboard
 # -----------------------------
@@ -417,38 +428,38 @@ with c3:
     st.metric("Saldo final forecast", f"{consolidado['SALDO'].iloc[-1]:,.2f} €")
 
 st.subheader("Evolución de saldo")
-saldo_series = consolidado[["FECHA", "SALDO"]].set_index("FECHA")
+saldo_series = consolidado2[["FECHA", "SALDO"]].set_index("FECHA")
 st.line_chart(saldo_series)
 
 # -----------------------------
-# Movimientos formato tesorería (con SALDO_MES = cierre del mes)
+# Movimientos formato tesorería (PREVISION = SALDO cierre del mes)
 # -----------------------------
 st.subheader("Movimientos (formato tesorería)")
 
-view = consolidado.copy()
+view = consolidado2.copy()
 view["VTO. PAGO"] = view["FECHA"].dt.strftime("%d-%m-%y")
-
 view["MES"] = view["FECHA"].dt.to_period("M").astype(str)
 
-# saldo de cierre mensual = último saldo del mes
 monthly_close = (
     view.sort_values("FECHA")
         .groupby("MES", as_index=False)
-        .agg(SALDO_MES=("SALDO", "last"))
+        .agg(PREVISION=("SALDO", "last"))
 )
 
 view = view.merge(monthly_close, on="MES", how="left")
 
-view_out = view[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO", "SALDO_MES"]].copy()
-view_out = view_out.rename(columns={"SALDO_MES": "PREVISION"})  # nombre que te interesa
-
+view_out = view[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO", "PREVISION"]].copy()
 st.dataframe(view_out, use_container_width=True)
 
 # -----------------------------
 # Resumen mensual
 # -----------------------------
 st.subheader("Resumen mensual")
-monthly = consolidado.groupby("MES", as_index=False).agg(
+
+tmp = consolidado2.copy()
+tmp["MES"] = tmp["FECHA"].dt.to_period("M").astype(str)
+
+monthly = tmp.groupby("MES", as_index=False).agg(
     COBROS=("COBROS", "sum"),
     PAGOS=("PAGOS", "sum"),
     NETO=("NETO", "sum"),
@@ -460,7 +471,7 @@ st.dataframe(monthly, use_container_width=True)
 # Export
 # -----------------------------
 st.subheader("Exportar")
-export_df = consolidado.copy()
+export_df = consolidado2.copy()
 export_df["FECHA"] = export_df["FECHA"].dt.date
 csv_bytes = export_df.to_csv(index=False).encode("utf-8")
 st.download_button(
