@@ -47,7 +47,7 @@ def coalesce_column(df: pd.DataFrame, target: str) -> pd.DataFrame:
     return df
 
 def find_header_row(df_raw: pd.DataFrame) -> int | None:
-    for i in range(min(60, len(df_raw))):
+    for i in range(min(80, len(df_raw))):
         row = df_raw.iloc[i].astype(str).str.strip().str.upper().tolist()
         if "GENERAL" in row and "TIPO" in row:
             return i
@@ -74,14 +74,11 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
 
     df = df.dropna(how="all").copy()
 
-    def clean_str(col):
-        if col not in df.columns:
-            df[col] = ""
-        df[col] = df[col].astype(str).str.strip()
-        return df
-
+    # Normaliza strings
     for c in ["GENERAL", "TIPO", "DEPARTAMENTO", "NATURALEZA", "PERIODICIDAD", "REGLA_FECHA", "AJUSTE FINDE"]:
-        df = clean_str(c)
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].astype(str).str.strip()
 
     df["TIPO"] = df["TIPO"].str.upper()
     df["DEPARTAMENTO"] = df["DEPARTAMENTO"].str.upper()
@@ -90,9 +87,13 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df["REGLA_FECHA"] = df["REGLA_FECHA"].str.upper()
     df["AJUSTE FINDE"] = df["AJUSTE FINDE"].str.upper()
 
+    # IMPORTE numérico (forecast)
     df["IMPORTE"] = pd.to_numeric(df["IMPORTE"], errors="coerce").fillna(0.0)
+
+    # LAG numérico
     df["LAG"] = pd.to_numeric(df["LAG"], errors="coerce").fillna(0).astype(int)
 
+    # DIA_MES a partir de VALOR_FECHA si es día o fecha
     def to_day_of_month(v):
         if pd.isna(v):
             return None
@@ -111,8 +112,11 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
         return None
 
     df["DIA_MES"] = df["VALOR_FECHA"].apply(to_day_of_month)
+
+    # FECHA_FIJA (si VALOR_FECHA es parseable como fecha)
     df["FECHA_FIJA"] = pd.to_datetime(df["VALOR_FECHA"], errors="coerce").dt.normalize()
 
+    # HASTA
     if "HASTA" in df.columns:
         df["HASTA"] = pd.to_datetime(df["HASTA"], errors="coerce").dt.normalize()
     else:
@@ -121,6 +125,7 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     return df
 
 def next_business_day(d: pd.Timestamp) -> pd.Timestamp:
+    # sáb/dom -> lunes
     if d.weekday() == 5:
         return d + pd.Timedelta(days=2)
     if d.weekday() == 6:
@@ -150,6 +155,11 @@ def months_step_from_periodicidad(periodicidad: str) -> int:
     return 1
 
 def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
+    """
+    Genera eventos hasta end_date (horizonte) y respeta HASTA.
+    Fix importante: MENSUAL/BIMESTRAL/TRIMESTRAL/SEMESTRAL se anclan a FECHA_FIJA del concepto,
+    no al start_date, para evitar duplicados/solapes.
+    """
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
     rows = []
 
@@ -176,8 +186,9 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 return False
             return True
 
-        # PUNTUAL
+        # ---------- PUNTUAL ----------
         if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF"):
+            # usa FECHA_FIJA si VALOR_FECHA es parseable, aunque REGLA_FECHA ponga DIA_MES
             if pd.isna(r.get("FECHA_FIJA")):
                 continue
             d = pd.Timestamp(r["FECHA_FIJA"]).normalize()
@@ -186,22 +197,23 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 rows.append((d, r))
             continue
 
-        # ANUAL
+        # ---------- ANUAL ----------
         if periodicidad == "ANUAL":
-            if not pd.isna(r.get("FECHA_FIJA")):
-                base = pd.Timestamp(r["FECHA_FIJA"]).normalize()
-                year = start_date.year
-                while True:
-                    candidate = pd.Timestamp(year=year, month=base.month, day=base.day)
-                    if candidate > end_date:
-                        break
-                    d = apply_adjustments(candidate)
-                    if within_limits(d):
-                        rows.append((d, r))
-                    year += 1
+            if pd.isna(r.get("FECHA_FIJA")):
+                continue
+            base = pd.Timestamp(r["FECHA_FIJA"]).normalize()
+            year = start_date.year
+            while True:
+                candidate = pd.Timestamp(year=year, month=base.month, day=base.day)
+                if candidate > end_date:
+                    break
+                d = apply_adjustments(candidate)
+                if within_limits(d):
+                    rows.append((d, r))
+                year += 1
             continue
 
-        # SEMANAL
+        # ---------- SEMANAL ----------
         if periodicidad == "SEMANAL":
             anchor = r.get("FECHA_FIJA")
             if pd.isna(anchor):
@@ -211,6 +223,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
             if not pd.isna(hasta):
                 stop = min(hasta, end_date)
             else:
+                # si no hay HASTA, por defecto solo dentro del mes del ancla (para filas "ENERO", "FEBRERO", etc.)
                 month_start = anchor.replace(day=1)
                 stop = (month_start + pd.offsets.MonthEnd(0)).normalize()
                 stop = min(stop, end_date)
@@ -223,39 +236,70 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 d = d + pd.Timedelta(days=7)
             continue
 
-        # POR MESES (MENSUAL/BIMESTRAL/TRIMESTRAL/SEMESTRAL)
-        step = months_step_from_periodicidad(periodicidad)
+        # ---------- PERIODICIDADES POR MESES (FIX: anclado a FECHA_FIJA) ----------
+        if periodicidad in ("MENSUAL", "BIMESTRAL", "BIMENSUAL", "TRIMESTRAL", "SEMESTRAL"):
+            step = months_step_from_periodicidad(periodicidad)
 
-        for m in range(0, months_horizon + 1):
-            if (m % step) != 0:
+            # ancla: FECHA_FIJA (que viene de VALOR_FECHA)
+            if pd.isna(r.get("FECHA_FIJA")) and regla != "DIA_MES":
+                # sin ancla no podemos generar
                 continue
 
-            month_start = (start_date + pd.offsets.MonthBegin(m)).normalize()
-            year = month_start.year
-            month = month_start.month
-
-            if regla == "DIA_MES":
+            # base_date:
+            # - si FECHA_FIJA existe, manda
+            # - si no, construimos una base usando el día (DIA_MES) y el mes/año de start_date para iniciar
+            if not pd.isna(r.get("FECHA_FIJA")):
+                base_date = pd.Timestamp(r["FECHA_FIJA"]).normalize()
+            else:
                 day = r.get("DIA_MES")
                 if not day or pd.isna(day):
                     continue
-                last_day = (pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)).day
-                day = int(min(int(day), int(last_day)))
-                d = pd.Timestamp(year=year, month=month, day=day)
+                # inicia en el mes de start_date
+                y, m = start_date.year, start_date.month
+                last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
+                base_date = pd.Timestamp(year=y, month=m, day=min(int(day), int(last_day))).normalize()
 
-            elif regla == "ULTIMO_HABIL":
-                d = pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
-                d = next_business_day(d) if d.weekday() >= 5 else d
+            current = base_date
 
-            elif regla == "FECHA_FIJA" and not pd.isna(r.get("FECHA_FIJA")):
-                base = pd.Timestamp(r["FECHA_FIJA"])
-                last_day = (pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)).day
-                d = pd.Timestamp(year=year, month=month, day=min(base.day, last_day))
-            else:
-                continue
+            # avanza hasta cubrir el horizonte
+            while current <= end_date:
+                # construir fecha del evento según regla
+                if regla == "DIA_MES":
+                    # usa el día de base_date y ajusta al último día del mes
+                    y, m = current.year, current.month
+                    day = current.day  # importante: queda fijado por el ancla
+                    last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
+                    d = pd.Timestamp(year=y, month=m, day=min(int(day), int(last_day))).normalize()
 
-            d = apply_adjustments(d)
-            if within_limits(d):
-                rows.append((d, r))
+                elif regla == "ULTIMO_HABIL":
+                    d = pd.Timestamp(year=current.year, month=current.month, day=1) + pd.offsets.MonthEnd(0)
+                    d = next_business_day(d) if d.weekday() >= 5 else d
+                    d = d.normalize()
+
+                elif regla == "FECHA_FIJA":
+                    # mensual con fecha fija -> usa el día del ancla en cada mes
+                    y, m = current.year, current.month
+                    day = base_date.day
+                    last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
+                    d = pd.Timestamp(year=y, month=m, day=min(int(day), int(last_day))).normalize()
+
+                else:
+                    # si no se reconoce, no generamos
+                    d = None
+
+                if d is not None:
+                    d = apply_adjustments(d)
+                    if within_limits(d):
+                        rows.append((d, r))
+
+                current = (current + pd.DateOffset(months=step)).normalize()
+
+            continue
+
+        # ---------- Default: tratar como MENSUAL (compatibilidad) ----------
+        # Si alguien mete "MENSUAL" mal escrito u otra cosa, intentamos no romper:
+        # pero mejor forzar en Excel.
+        continue
 
     if not rows:
         return pd.DataFrame(columns=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE", "NATURALEZA"])
@@ -280,12 +324,6 @@ def compute_balance(df: pd.DataFrame, starting_balance: float) -> pd.DataFrame:
     return df
 
 # --- Extensión ingresos año anterior (semanal viernes) limitada por end_date ---
-def count_fridays_in_month(year: int, month: int) -> int:
-    start = pd.Timestamp(year=year, month=month, day=1)
-    end = (start + pd.offsets.MonthEnd(0)).normalize()
-    days = pd.date_range(start, end, freq="D")
-    return int((days.weekday == 4).sum())
-
 def extend_ingresos_from_previous_year_weekly(generated: pd.DataFrame, growth: float, end_date: pd.Timestamp) -> pd.DataFrame:
     gen = generated.copy()
     gen["YEAR"] = gen["FECHA"].dt.year
@@ -306,10 +344,10 @@ def extend_ingresos_from_previous_year_weekly(generated: pd.DataFrame, growth: f
     monthly_base["IMPORTE"] = monthly_base["IMPORTE"] * float(growth)
 
     rows = []
-    for _, r in monthly_base.iterrows():
-        month = int(r["MONTH"])
-        dept = r["DEPARTAMENTO"]
-        total_mes = float(r["IMPORTE"])
+    for _, rr in monthly_base.iterrows():
+        month = int(rr["MONTH"])
+        dept = rr["DEPARTAMENTO"]
+        total_mes = float(rr["IMPORTE"])
 
         start = pd.Timestamp(year=target_year, month=month, day=1)
         end = (start + pd.offsets.MonthEnd(0)).normalize()
@@ -350,6 +388,8 @@ months_horizon = st.sidebar.slider("Horizonte forecast (meses)", min_value=1, ma
 extend_ingresos = st.sidebar.checkbox("Extender INGRESOS usando año anterior (AUTO)", value=True)
 growth = st.sidebar.number_input("Factor crecimiento año extendido", min_value=0.0, max_value=3.0, value=1.00, step=0.01)
 
+dedupe_exact = st.sidebar.checkbox("Eliminar duplicados exactos (red de seguridad)", value=True)
+
 uploaded = st.sidebar.file_uploader("Sube el Excel de catálogo (xlsx)", type=["xlsx"])
 
 # -----------------------------
@@ -377,6 +417,10 @@ generated = generate_events_from_catalog(
 # Extensión automática (limitada por end_ts)
 if extend_ingresos and not generated.empty:
     generated = extend_ingresos_from_previous_year_weekly(generated, growth, end_ts)
+
+# Dedupe exacto (por si el Excel trae filas repetidas o por seguridad)
+if dedupe_exact and not generated.empty:
+    generated = generated.drop_duplicates(subset=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE"], keep="first")
 
 if generated.empty:
     st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / VALOR_FECHA / HASTA).")
@@ -417,27 +461,22 @@ saldo_series = consolidado[["FECHA", "SALDO"]].set_index("FECHA")
 st.line_chart(saldo_series)
 
 # -----------------------------
-# Vista "tipo Excel": VTO_PAGO / CONCEPTO / COBROS / PAGOS / SALDO / PREVISION MES
+# Vista "tipo Excel": VTO. PAGO / CONCEPTO / COBROS / PAGOS / SALDO / PREVISION MES
 # -----------------------------
 st.subheader("Movimientos (formato tesorería)")
 
 view = consolidado.copy()
 view["VTO. PAGO"] = view["FECHA"].dt.strftime("%d-%m-%y")
-view["CONCEPTO"] = view["CONCEPTO"].astype(str)
 
-# Previsión del mes = neto del mes (cobros - pagos) para el mes del movimiento
+# Previsión del mes = NETO total del mes (cobros - pagos)
 tmp = view.copy()
 tmp["MES"] = tmp["FECHA"].dt.to_period("M").astype(str)
-monthly_forecast = tmp.groupby("MES", as_index=False).agg(
-    PREVISION_MES=("NETO", "sum")
-)
+monthly_forecast = tmp.groupby("MES", as_index=False).agg(PREVISION_MES=("NETO", "sum"))
+
 view["MES"] = view["FECHA"].dt.to_period("M").astype(str)
 view = view.merge(monthly_forecast, on="MES", how="left")
 
-# columnas finales
 view_out = view[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO", "PREVISION_MES"]].copy()
-
-# Formato numérico (visual, no texto)
 st.dataframe(view_out, use_container_width=True)
 
 # -----------------------------
