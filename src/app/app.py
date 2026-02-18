@@ -13,7 +13,6 @@ st.title("APP Tesorería — Dashboard")
 # Helpers
 # -----------------------------
 
-# Columnas mínimas necesarias
 MIN_REQUIRED = [
     "GENERAL", "TIPO", "DEPARTAMENTO",
     "NATURALEZA", "PERIODICIDAD",
@@ -21,7 +20,6 @@ MIN_REQUIRED = [
     "LAG", "AJUSTE FINDE"
 ]
 
-# Alias de nombres entre versiones de Excel
 COL_ALIASES = {
     "IMPORTE": ["IMPORTE", "IMPORTE PRONOSTICADO", "IMPORTE_PRONOSTICADO"],
     "HASTA": ["HASTA", "FECHA_FIN", "FIN", "HASTA_FECHA"],
@@ -92,13 +90,9 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df["REGLA_FECHA"] = df["REGLA_FECHA"].str.upper()
     df["AJUSTE FINDE"] = df["AJUSTE FINDE"].str.upper()
 
-    # IMPORTE numérico (forecast)
     df["IMPORTE"] = pd.to_numeric(df["IMPORTE"], errors="coerce").fillna(0.0)
-
-    # LAG numérico
     df["LAG"] = pd.to_numeric(df["LAG"], errors="coerce").fillna(0).astype(int)
 
-    # VALOR_FECHA: puede venir como fecha o como número (día)
     def to_day_of_month(v):
         if pd.isna(v):
             return None
@@ -119,7 +113,6 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df["DIA_MES"] = df["VALOR_FECHA"].apply(to_day_of_month)
     df["FECHA_FIJA"] = pd.to_datetime(df["VALOR_FECHA"], errors="coerce").dt.normalize()
 
-    # HASTA
     if "HASTA" in df.columns:
         df["HASTA"] = pd.to_datetime(df["HASTA"], errors="coerce").dt.normalize()
     else:
@@ -183,9 +176,8 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 return False
             return True
 
-        # ---------- PUNTUAL ----------
+        # PUNTUAL
         if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF"):
-            # usa FECHA_FIJA si VALOR_FECHA es parseable, aunque REGLA_FECHA sea DIA_MES
             if pd.isna(r.get("FECHA_FIJA")):
                 continue
             d = pd.Timestamp(r["FECHA_FIJA"]).normalize()
@@ -194,7 +186,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 rows.append((d, r))
             continue
 
-        # ---------- ANUAL ----------
+        # ANUAL
         if periodicidad == "ANUAL":
             if not pd.isna(r.get("FECHA_FIJA")):
                 base = pd.Timestamp(r["FECHA_FIJA"]).normalize()
@@ -209,7 +201,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                     year += 1
             continue
 
-        # ---------- SEMANAL ----------
+        # SEMANAL
         if periodicidad == "SEMANAL":
             anchor = r.get("FECHA_FIJA")
             if pd.isna(anchor):
@@ -231,7 +223,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 d = d + pd.Timedelta(days=7)
             continue
 
-        # ---------- PERIODICIDADES POR MESES ----------
+        # POR MESES (MENSUAL/BIMESTRAL/TRIMESTRAL/SEMESTRAL)
         step = months_step_from_periodicidad(periodicidad)
 
         for m in range(0, months_horizon + 1):
@@ -287,18 +279,14 @@ def compute_balance(df: pd.DataFrame, starting_balance: float) -> pd.DataFrame:
     df["SALDO"] = starting_balance + df["NETO"].cumsum()
     return df
 
+# --- Extensión ingresos año anterior (semanal viernes) limitada por end_date ---
 def count_fridays_in_month(year: int, month: int) -> int:
     start = pd.Timestamp(year=year, month=month, day=1)
     end = (start + pd.offsets.MonthEnd(0)).normalize()
     days = pd.date_range(start, end, freq="D")
-    return int((days.weekday == 4).sum())  # viernes=4
+    return int((days.weekday == 4).sum())
 
-def extend_ingresos_from_previous_year_weekly(generated: pd.DataFrame, growth: float) -> pd.DataFrame:
-    """
-    Extiende ingresos del primer año completo detectado al siguiente año.
-    Método: por MES y DEPARTAMENTO, toma el total de ingresos del año base y lo replica en el mismo mes del año siguiente,
-    repartido en importes semanales (viernes) para poder filtrar por semanas.
-    """
+def extend_ingresos_from_previous_year_weekly(generated: pd.DataFrame, growth: float, end_date: pd.Timestamp) -> pd.DataFrame:
     gen = generated.copy()
     gen["YEAR"] = gen["FECHA"].dt.year
     gen["MONTH"] = gen["FECHA"].dt.month
@@ -323,20 +311,21 @@ def extend_ingresos_from_previous_year_weekly(generated: pd.DataFrame, growth: f
         dept = r["DEPARTAMENTO"]
         total_mes = float(r["IMPORTE"])
 
-        # viernes del mes
-        n_viernes = count_fridays_in_month(target_year, month)
-        if n_viernes <= 0:
-            continue
-        importe_viernes = total_mes / n_viernes
-
-        # primer viernes del mes
         start = pd.Timestamp(year=target_year, month=month, day=1)
         end = (start + pd.offsets.MonthEnd(0)).normalize()
         fridays = pd.date_range(start, end, freq="W-FRI")
+        n_viernes = len(fridays)
+        if n_viernes == 0:
+            continue
+
+        importe_viernes = total_mes / n_viernes
 
         for d in fridays:
+            d = pd.Timestamp(d).normalize()
+            if d > end_date:
+                continue
             rows.append({
-                "FECHA": pd.Timestamp(d).normalize(),
+                "FECHA": d,
                 "CONCEPTO": f"INGRESO AUTO {target_year} (base {base_year})",
                 "TIPO": "INGRESO",
                 "DEPARTAMENTO": dept,
@@ -377,6 +366,7 @@ except Exception as e:
     st.stop()
 
 start_ts = pd.Timestamp(saldo_fecha).normalize()
+end_ts = (start_ts + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
 
 generated = generate_events_from_catalog(
     catalog=catalog,
@@ -384,16 +374,18 @@ generated = generate_events_from_catalog(
     months_horizon=months_horizon
 )
 
-# Extensión automática de ingresos (2027 basado en 2026, semanal por viernes)
+# Extensión automática (limitada por end_ts)
 if extend_ingresos and not generated.empty:
-    generated = extend_ingresos_from_previous_year_weekly(generated, growth)
+    generated = extend_ingresos_from_previous_year_weekly(generated, growth, end_ts)
 
 if generated.empty:
     st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / VALOR_FECHA / HASTA).")
     st.dataframe(catalog.head(50), use_container_width=True)
     st.stop()
 
+# -----------------------------
 # Filtros
+# -----------------------------
 st.sidebar.header("Filtros")
 deptos = sorted(generated["DEPARTAMENTO"].dropna().unique().tolist())
 tipos = sorted(generated["TIPO"].dropna().unique().tolist())
@@ -424,6 +416,33 @@ st.subheader("Evolución de saldo")
 saldo_series = consolidado[["FECHA", "SALDO"]].set_index("FECHA")
 st.line_chart(saldo_series)
 
+# -----------------------------
+# Vista "tipo Excel": VTO_PAGO / CONCEPTO / COBROS / PAGOS / SALDO / PREVISION MES
+# -----------------------------
+st.subheader("Movimientos (formato tesorería)")
+
+view = consolidado.copy()
+view["VTO. PAGO"] = view["FECHA"].dt.strftime("%d-%m-%y")
+view["CONCEPTO"] = view["CONCEPTO"].astype(str)
+
+# Previsión del mes = neto del mes (cobros - pagos) para el mes del movimiento
+tmp = view.copy()
+tmp["MES"] = tmp["FECHA"].dt.to_period("M").astype(str)
+monthly_forecast = tmp.groupby("MES", as_index=False).agg(
+    PREVISION_MES=("NETO", "sum")
+)
+view["MES"] = view["FECHA"].dt.to_period("M").astype(str)
+view = view.merge(monthly_forecast, on="MES", how="left")
+
+# columnas finales
+view_out = view[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO", "PREVISION_MES"]].copy()
+
+# Formato numérico (visual, no texto)
+st.dataframe(view_out, use_container_width=True)
+
+# -----------------------------
+# Resumen mensual
+# -----------------------------
 st.subheader("Resumen mensual")
 consolidado["MES"] = consolidado["FECHA"].dt.to_period("M").astype(str)
 monthly = consolidado.groupby("MES", as_index=False).agg(
@@ -433,10 +452,9 @@ monthly = consolidado.groupby("MES", as_index=False).agg(
 )
 st.dataframe(monthly, use_container_width=True)
 
-st.subheader("Movimientos consolidados")
-st.dataframe(consolidado, use_container_width=True)
-
+# -----------------------------
 # Export
+# -----------------------------
 st.subheader("Exportar")
 export_df = consolidado.copy()
 export_df["FECHA"] = export_df["FECHA"].dt.date
@@ -447,4 +465,3 @@ st.download_button(
     file_name="movimientos_consolidado.csv",
     mime="text/csv"
 )
-
