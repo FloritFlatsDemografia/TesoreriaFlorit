@@ -1,5 +1,7 @@
 import re
 from datetime import date
+from io import BytesIO
+
 import pandas as pd
 import streamlit as st
 
@@ -213,7 +215,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 d = d + pd.Timedelta(days=7)
             continue
 
-        # PERIODICIDADES POR MESES (anclado, y día anclado)
+        # PERIODICIDADES POR MESES
         if periodicidad in ("MENSUAL", "BIMESTRAL", "BIMENSUAL", "TRIMESTRAL", "SEMESTRAL"):
             step = months_step_from_periodicidad(periodicidad)
 
@@ -254,8 +256,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 current = (current + pd.DateOffset(months=step)).normalize()
 
             continue
-
-        continue
 
     if not rows:
         return pd.DataFrame(columns=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE", "NATURALEZA"])
@@ -334,21 +334,25 @@ if generated.empty:
     st.dataframe(catalog.head(50), use_container_width=True)
     st.stop()
 
-# Filtros
-st.sidebar.header("Filtros")
+# -----------------------------
+# Filtros base (afectan al cálculo real)
+# -----------------------------
+st.sidebar.header("Filtros base (afectan al saldo real)")
 deptos = sorted(generated["DEPARTAMENTO"].dropna().unique().tolist())
 tipos = sorted(generated["TIPO"].dropna().unique().tolist())
 
 sel_deptos = st.sidebar.multiselect("Departamento", options=deptos, default=deptos)
 sel_tipos = st.sidebar.multiselect("Tipo", options=tipos, default=tipos)
 
-filtered = generated[
+base_filtered = generated[
     generated["DEPARTAMENTO"].isin(sel_deptos) &
     generated["TIPO"].isin(sel_tipos)
 ].copy()
 
-filtered = filtered.sort_values("FECHA").reset_index(drop=True)
-consolidado = compute_balance(filtered, float(saldo_hoy))
+base_filtered = base_filtered.sort_values("FECHA").reset_index(drop=True)
+
+# Saldo REAL (no depende del buscador ni del rango de fechas, MODO 1)
+consolidado = compute_balance(base_filtered, float(saldo_hoy))
 
 # Insertar fila inicial tipo Excel: SALDO BANCOS TOTAL
 base_row = pd.DataFrame([{
@@ -370,17 +374,49 @@ consolidado2.loc[0, "_ORD"] = 0
 consolidado2 = consolidado2.sort_values(["FECHA", "_ORD"]).drop(columns=["_ORD"]).reset_index(drop=True)
 
 # -----------------------------
-# Dashboard
+# Buscador + rango fechas (MODO 1: solo visualización)
+# -----------------------------
+st.sidebar.header("Búsqueda y rango (solo visualización)")
+q = st.sidebar.text_input("Buscar concepto", value="").strip()
+
+min_d = consolidado2["FECHA"].min().date()
+max_d = consolidado2["FECHA"].max().date()
+
+date_range = st.sidebar.date_input(
+    "Rango de fechas",
+    value=(min_d, max_d),
+    min_value=min_d,
+    max_value=max_d
+)
+
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    d_from, d_to = date_range
+else:
+    d_from, d_to = min_d, max_d
+
+view_df = consolidado2.copy()
+
+# aplicar rango
+view_df = view_df[(view_df["FECHA"].dt.date >= d_from) & (view_df["FECHA"].dt.date <= d_to)].copy()
+
+# aplicar buscador (solo CONCEPTO)
+if q:
+    view_df = view_df[view_df["CONCEPTO"].astype(str).str.contains(q, case=False, na=False)].copy()
+
+view_df = view_df.sort_values("FECHA").reset_index(drop=True)
+
+# -----------------------------
+# Dashboard (siempre saldo real)
 # -----------------------------
 c1, c2, c3 = st.columns(3)
 with c1:
     st.metric("Saldo inicial (hoy)", eur(saldo_hoy))
 with c2:
-    st.metric("Neto periodo", eur(consolidado["NETO"].sum()))
+    st.metric("Neto periodo (filtros base)", eur(consolidado["NETO"].sum()))
 with c3:
-    st.metric("Saldo final forecast", eur(consolidado["SALDO"].iloc[-1]))
+    st.metric("Saldo final forecast (filtros base)", eur(consolidado["SALDO"].iloc[-1]))
 
-st.subheader("Evolución de saldo")
+st.subheader("Evolución de saldo (saldo real)")
 saldo_series = consolidado2[["FECHA", "SALDO"]].set_index("FECHA")
 st.line_chart(saldo_series)
 
@@ -389,13 +425,13 @@ st.line_chart(saldo_series)
 # -----------------------------
 st.subheader("Movimientos (formato tesorería)")
 
-view = consolidado2.copy()
-view["VTO. PAGO"] = view["FECHA"].dt.strftime("%d-%m-%y")
+mov = view_df.copy()
+mov["VTO. PAGO"] = mov["FECHA"].dt.strftime("%d-%m-%y")
 
-view_out = view[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO"]].copy()
+mov_out = mov[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO"]].copy()
 
 styled_mov = (
-    view_out.style
+    mov_out.style
     .applymap(color_saldo, subset=["SALDO"])
     .format({
         "COBROS": eur,
@@ -407,11 +443,11 @@ styled_mov = (
 st.dataframe(styled_mov, use_container_width=True)
 
 # -----------------------------
-# Resumen mensual (2 decimales + €)
+# Resumen mensual (sobre lo visible)
 # -----------------------------
-st.subheader("Resumen mensual")
+st.subheader("Resumen mensual (según lo visible)")
 
-tmp = consolidado2.copy()
+tmp = view_df.copy()
 tmp["MES"] = tmp["FECHA"].dt.to_period("M").astype(str)
 
 monthly = tmp.groupby("MES", as_index=False).agg(
@@ -421,28 +457,42 @@ monthly = tmp.groupby("MES", as_index=False).agg(
     SALDO_CIERRE=("SALDO", "last")
 )
 
-styled_month = (
-    monthly.style
-    .format({
-        "COBROS": eur,
-        "PAGOS": eur,
-        "NETO": eur,
-        "SALDO_CIERRE": eur,
-    })
-)
+styled_month = monthly.style.format({
+    "COBROS": eur,
+    "PAGOS": eur,
+    "NETO": eur,
+    "SALDO_CIERRE": eur,
+})
 
 st.dataframe(styled_month, use_container_width=True)
 
 # -----------------------------
-# Export (CSV numérico sin €)
+# Exportar a Excel (lo visible)
 # -----------------------------
-st.subheader("Exportar")
-export_df = consolidado2.copy()
-export_df["FECHA"] = export_df["FECHA"].dt.date
-csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+st.subheader("Exportar (lo visible)")
+
+# Datos exportables (numéricos, sin €)
+export_mov = mov_out.copy()
+for c in ["COBROS", "PAGOS", "SALDO"]:
+    export_mov[c] = pd.to_numeric(export_mov[c], errors="coerce")
+
+export_month = monthly.copy()
+for c in ["COBROS", "PAGOS", "NETO", "SALDO_CIERRE"]:
+    export_month[c] = pd.to_numeric(export_month[c], errors="coerce")
+
+def build_excel_bytes(df_mov: pd.DataFrame, df_month: pd.DataFrame) -> bytes:
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df_mov.to_excel(writer, index=False, sheet_name="Movimientos")
+        df_month.to_excel(writer, index=False, sheet_name="Resumen_mensual")
+    bio.seek(0)
+    return bio.read()
+
+xlsx_bytes = build_excel_bytes(export_mov, export_month)
+
 st.download_button(
-    "Descargar consolidado (CSV)",
-    data=csv_bytes,
-    file_name="movimientos_consolidado.csv",
-    mime="text/csv"
+    "Descargar Excel (XLSX)",
+    data=xlsx_bytes,
+    file_name="tesoreria_export.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
