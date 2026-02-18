@@ -416,9 +416,33 @@ with c2:
 with c3:
     st.metric("Saldo final forecast (filtros base)", eur(consolidado["SALDO"].iloc[-1]))
 
-st.subheader("Evolución de saldo (saldo real)")
-saldo_series = consolidado2[["FECHA", "SALDO"]].set_index("FECHA")
-st.line_chart(saldo_series)
+# -----------------------------
+# Gráfico diario (saldo real)
+# -----------------------------
+st.subheader("Evolución de saldo (saldo real) — diario")
+
+saldo_daily = consolidado2[["FECHA", "SALDO"]].copy()
+saldo_daily["FECHA"] = pd.to_datetime(saldo_daily["FECHA"]).dt.normalize()
+
+# si hay varias filas el mismo día, nos quedamos con el último saldo del día
+saldo_daily = saldo_daily.groupby("FECHA", as_index=False)["SALDO"].last()
+
+all_days = pd.date_range(
+    start=saldo_daily["FECHA"].min(),
+    end=saldo_daily["FECHA"].max(),
+    freq="D"
+)
+
+saldo_daily = (
+    saldo_daily.set_index("FECHA")
+    .reindex(all_days)
+    .rename_axis("FECHA")
+)
+
+saldo_daily["SALDO"] = saldo_daily["SALDO"].ffill()
+saldo_daily["SALDO"] = saldo_daily["SALDO"].fillna(float(saldo_hoy))
+
+st.line_chart(saldo_daily[["SALDO"]])
 
 # -----------------------------
 # Movimientos formato tesorería (sin PREVISION, saldo coloreado, 2 decimales + €)
