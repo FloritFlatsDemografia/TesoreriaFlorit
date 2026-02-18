@@ -13,6 +13,7 @@ st.title("APP Tesorería — Dashboard")
 # Helpers
 # -----------------------------
 
+# Columnas mínimas necesarias
 MIN_REQUIRED = [
     "GENERAL", "TIPO", "DEPARTAMENTO",
     "NATURALEZA", "PERIODICIDAD",
@@ -20,6 +21,7 @@ MIN_REQUIRED = [
     "LAG", "AJUSTE FINDE"
 ]
 
+# Alias de nombres entre versiones de Excel
 COL_ALIASES = {
     "IMPORTE": ["IMPORTE", "IMPORTE PRONOSTICADO", "IMPORTE_PRONOSTICADO"],
     "HASTA": ["HASTA", "FECHA_FIN", "FIN", "HASTA_FECHA"],
@@ -47,7 +49,7 @@ def coalesce_column(df: pd.DataFrame, target: str) -> pd.DataFrame:
     return df
 
 def find_header_row(df_raw: pd.DataFrame) -> int | None:
-    for i in range(min(50, len(df_raw))):
+    for i in range(min(60, len(df_raw))):
         row = df_raw.iloc[i].astype(str).str.strip().str.upper().tolist()
         if "GENERAL" in row and "TIPO" in row:
             return i
@@ -90,9 +92,13 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df["REGLA_FECHA"] = df["REGLA_FECHA"].str.upper()
     df["AJUSTE FINDE"] = df["AJUSTE FINDE"].str.upper()
 
+    # IMPORTE numérico (forecast)
     df["IMPORTE"] = pd.to_numeric(df["IMPORTE"], errors="coerce").fillna(0.0)
+
+    # LAG numérico
     df["LAG"] = pd.to_numeric(df["LAG"], errors="coerce").fillna(0).astype(int)
 
+    # VALOR_FECHA: puede venir como fecha o como número (día)
     def to_day_of_month(v):
         if pd.isna(v):
             return None
@@ -113,6 +119,7 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df["DIA_MES"] = df["VALOR_FECHA"].apply(to_day_of_month)
     df["FECHA_FIJA"] = pd.to_datetime(df["VALOR_FECHA"], errors="coerce").dt.normalize()
 
+    # HASTA
     if "HASTA" in df.columns:
         df["HASTA"] = pd.to_datetime(df["HASTA"], errors="coerce").dt.normalize()
     else:
@@ -178,8 +185,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
 
         # ---------- PUNTUAL ----------
         if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF"):
-            # CAMBIO CLAVE:
-            # Si VALOR_FECHA se parsea como fecha (FECHA_FIJA), la usamos aunque REGLA_FECHA sea DIA_MES.
+            # usa FECHA_FIJA si VALOR_FECHA es parseable, aunque REGLA_FECHA sea DIA_MES
             if pd.isna(r.get("FECHA_FIJA")):
                 continue
             d = pd.Timestamp(r["FECHA_FIJA"]).normalize()
@@ -281,6 +287,69 @@ def compute_balance(df: pd.DataFrame, starting_balance: float) -> pd.DataFrame:
     df["SALDO"] = starting_balance + df["NETO"].cumsum()
     return df
 
+def count_fridays_in_month(year: int, month: int) -> int:
+    start = pd.Timestamp(year=year, month=month, day=1)
+    end = (start + pd.offsets.MonthEnd(0)).normalize()
+    days = pd.date_range(start, end, freq="D")
+    return int((days.weekday == 4).sum())  # viernes=4
+
+def extend_ingresos_from_previous_year_weekly(generated: pd.DataFrame, growth: float) -> pd.DataFrame:
+    """
+    Extiende ingresos del primer año completo detectado al siguiente año.
+    Método: por MES y DEPARTAMENTO, toma el total de ingresos del año base y lo replica en el mismo mes del año siguiente,
+    repartido en importes semanales (viernes) para poder filtrar por semanas.
+    """
+    gen = generated.copy()
+    gen["YEAR"] = gen["FECHA"].dt.year
+    gen["MONTH"] = gen["FECHA"].dt.month
+
+    years = sorted(gen["YEAR"].dropna().unique().tolist())
+    if len(years) < 1:
+        return generated
+
+    base_year = years[0]
+    target_year = base_year + 1
+
+    base_ing = gen[(gen["TIPO"] == "INGRESO") & (gen["YEAR"] == base_year)]
+    if base_ing.empty:
+        return generated
+
+    monthly_base = base_ing.groupby(["MONTH", "DEPARTAMENTO"], as_index=False)["IMPORTE"].sum()
+    monthly_base["IMPORTE"] = monthly_base["IMPORTE"] * float(growth)
+
+    rows = []
+    for _, r in monthly_base.iterrows():
+        month = int(r["MONTH"])
+        dept = r["DEPARTAMENTO"]
+        total_mes = float(r["IMPORTE"])
+
+        # viernes del mes
+        n_viernes = count_fridays_in_month(target_year, month)
+        if n_viernes <= 0:
+            continue
+        importe_viernes = total_mes / n_viernes
+
+        # primer viernes del mes
+        start = pd.Timestamp(year=target_year, month=month, day=1)
+        end = (start + pd.offsets.MonthEnd(0)).normalize()
+        fridays = pd.date_range(start, end, freq="W-FRI")
+
+        for d in fridays:
+            rows.append({
+                "FECHA": pd.Timestamp(d).normalize(),
+                "CONCEPTO": f"INGRESO AUTO {target_year} (base {base_year})",
+                "TIPO": "INGRESO",
+                "DEPARTAMENTO": dept,
+                "IMPORTE": float(importe_viernes),
+                "NATURALEZA": "AUTO"
+            })
+
+    if not rows:
+        return generated
+
+    gen2 = pd.concat([generated, pd.DataFrame(rows)], ignore_index=True)
+    return gen2.sort_values("FECHA").reset_index(drop=True)
+
 # -----------------------------
 # Sidebar inputs
 # -----------------------------
@@ -288,6 +357,9 @@ st.sidebar.header("Inputs")
 saldo_fecha = st.sidebar.date_input("Fecha del saldo (hoy)", value=date.today())
 saldo_hoy = st.sidebar.number_input("Saldo actual en banco (€)", min_value=-1e12, max_value=1e12, value=0.0, step=100.0)
 months_horizon = st.sidebar.slider("Horizonte forecast (meses)", min_value=1, max_value=36, value=12)
+
+extend_ingresos = st.sidebar.checkbox("Extender INGRESOS usando año anterior (AUTO)", value=True)
+growth = st.sidebar.number_input("Factor crecimiento año extendido", min_value=0.0, max_value=3.0, value=1.00, step=0.01)
 
 uploaded = st.sidebar.file_uploader("Sube el Excel de catálogo (xlsx)", type=["xlsx"])
 
@@ -311,6 +383,10 @@ generated = generate_events_from_catalog(
     start_date=start_ts,
     months_horizon=months_horizon
 )
+
+# Extensión automática de ingresos (2027 basado en 2026, semanal por viernes)
+if extend_ingresos and not generated.empty:
+    generated = extend_ingresos_from_previous_year_weekly(generated, growth)
 
 if generated.empty:
     st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / VALOR_FECHA / HASTA).")
@@ -371,3 +447,4 @@ st.download_button(
     file_name="movimientos_consolidado.csv",
     mime="text/csv"
 )
+
