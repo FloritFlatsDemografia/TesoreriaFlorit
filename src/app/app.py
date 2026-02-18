@@ -267,7 +267,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 if regla == "DIA_MES":
                     # usa el día de base_date y ajusta al último día del mes
                     y, m = current.year, current.month
-                    day = current.day  # importante: queda fijado por el ancla
+                    day = base_date.day  # importante: queda fijado por el ancla
                     last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
                     d = pd.Timestamp(year=y, month=m, day=min(int(day), int(last_day))).normalize()
 
