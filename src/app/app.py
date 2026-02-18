@@ -43,12 +43,11 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df = pd.read_excel(uploaded_file, sheet_name=0, header=header_idx, engine="openpyxl")
     df = normalize_cols(df)
 
-    # Requeridas mínimas
     missing = [c for c in MIN_REQUIRED if c not in df.columns]
     if missing:
         raise ValueError(f"Faltan columnas requeridas: {missing}. Columnas detectadas: {list(df.columns)}")
 
-    # Asegurar columnas de importes
+    # Importes
     if "IMPORTE PRONOSTICADO" not in df.columns:
         if "IMPORTE_PRONOSTICADO" in df.columns:
             df["IMPORTE PRONOSTICADO"] = df["IMPORTE_PRONOSTICADO"]
@@ -56,13 +55,12 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
             raise ValueError("Falta columna: 'IMPORTE PRONOSTICADO'")
 
     if "IMPORTE REAL" not in df.columns:
-        # si no existe, la creamos vacía (0) para no romper
         if "IMPORTE_REAL" in df.columns:
             df["IMPORTE REAL"] = df["IMPORTE_REAL"]
         else:
             df["IMPORTE REAL"] = 0.0
 
-    # HASTA opcional
+    # HASTA (opcional)
     if "HASTA" not in df.columns:
         df["HASTA"] = pd.NaT
     df["HASTA"] = pd.to_datetime(df["HASTA"], errors="coerce").dt.normalize()
@@ -79,7 +77,6 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df["REGLA_FECHA"] = df["REGLA_FECHA"].str.upper()
     df["AJUSTE FINDE"] = df["AJUSTE FINDE"].str.upper()
 
-    # Importes numéricos
     df["IMPORTE_PRON"] = pd.to_numeric(df["IMPORTE PRONOSTICADO"], errors="coerce").fillna(0.0)
     df["IMPORTE_REAL"] = pd.to_numeric(df["IMPORTE REAL"], errors="coerce").fillna(0.0)
 
@@ -137,6 +134,11 @@ def months_step_from_periodicidad(periodicidad: str) -> int:
     return 1
 
 def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
+    """
+    IMPORTANTÍSIMO:
+    - HASTA se interpreta como "última cuota PROGRAMADA" (fecha base, sin SIG_HABIL ni LAG).
+    - Una vez la cuota existe (d_base <= HASTA), se aplican ajustes y se incluye aunque d_adj > HASTA.
+    """
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
     rows = []
 
@@ -156,21 +158,30 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 d = add_business_days(d, lag)
             return d
 
-        def within_limits(d: pd.Timestamp) -> bool:
-            if d < start_date or d > end_date:
+        def within_limits_base(d_base: pd.Timestamp) -> bool:
+            # valida HASTA sobre la fecha base (sin ajustes)
+            if d_base < start_date or d_base > end_date:
                 return False
-            if not pd.isna(hasta) and d > hasta:
+            if not pd.isna(hasta) and d_base > hasta:
                 return False
             return True
+
+        def within_limits_adjusted(d_adj: pd.Timestamp) -> bool:
+            # tras ajustes, solo recortamos por horizonte general
+            return (d_adj >= start_date) and (d_adj <= end_date)
+
+        def add_if_valid(d_base: pd.Timestamp):
+            d_base = pd.Timestamp(d_base).normalize()
+            if within_limits_base(d_base):
+                d_adj = apply_adjustments(d_base)
+                if within_limits_adjusted(d_adj):
+                    rows.append((d_adj, r))
 
         # PUNTUAL
         if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF"):
             if pd.isna(r.get("FECHA_FIJA")):
                 continue
-            d = pd.Timestamp(r["FECHA_FIJA"]).normalize()
-            d = apply_adjustments(d)
-            if within_limits(d):
-                rows.append((d, r))
+            add_if_valid(pd.Timestamp(r["FECHA_FIJA"]).normalize())
             continue
 
         # ANUAL
@@ -183,13 +194,11 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 candidate = pd.Timestamp(year=year, month=base.month, day=base.day)
                 if candidate > end_date:
                     break
-                d = apply_adjustments(candidate)
-                if within_limits(d):
-                    rows.append((d, r))
+                add_if_valid(candidate.normalize())
                 year += 1
             continue
 
-        # SEMANAL (semanas del mes del anchor, o hasta HASTA)
+        # SEMANAL
         if periodicidad == "SEMANAL":
             anchor = r.get("FECHA_FIJA")
             if pd.isna(anchor):
@@ -205,18 +214,17 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
 
             d = anchor
             while d <= stop:
-                dd = apply_adjustments(d)
-                if within_limits(dd):
-                    rows.append((dd, r))
+                add_if_valid(d.normalize())
                 d = d + pd.Timedelta(days=7)
             continue
 
-        # Por meses
+        # MENSUAL / BIMESTRAL / TRIMESTRAL / SEMESTRAL
         if periodicidad in ("MENSUAL", "BIMESTRAL", "BIMENSUAL", "TRIMESTRAL", "SEMESTRAL"):
             step = months_step_from_periodicidad(periodicidad)
 
             if not pd.isna(r.get("FECHA_FIJA")):
                 base_date = pd.Timestamp(r["FECHA_FIJA"]).normalize()
+                anchor_day = base_date.day
             else:
                 day = r.get("DIA_MES")
                 if not day or pd.isna(day):
@@ -224,30 +232,28 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 y, m = start_date.year, start_date.month
                 last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
                 base_date = pd.Timestamp(year=y, month=m, day=min(int(day), int(last_day))).normalize()
+                anchor_day = base_date.day
 
-            anchor_day = base_date.day
             current = base_date
 
             while current <= end_date:
                 y, m = current.year, current.month
 
-                if regla == "DIA_MES":
+                if regla in ("DIA_MES", "FECHA_FIJA"):
                     last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
-                    d = pd.Timestamp(year=y, month=m, day=min(int(anchor_day), int(last_day))).normalize()
-                elif regla == "ULTIMO_HABIL":
-                    d = pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)
-                    d = next_business_day(d) if d.weekday() >= 5 else d
-                    d = d.normalize()
-                elif regla == "FECHA_FIJA":
-                    last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
-                    d = pd.Timestamp(year=y, month=m, day=min(int(anchor_day), int(last_day))).normalize()
-                else:
-                    d = None
+                    d_base = pd.Timestamp(year=y, month=m, day=min(int(anchor_day), int(last_day))).normalize()
 
-                if d is not None:
-                    d = apply_adjustments(d)
-                    if within_limits(d):
-                        rows.append((d, r))
+                elif regla == "ULTIMO_HABIL":
+                    d_base = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).normalize()
+                    # ojo: ULTIMO_HABIL es "base" ya hábil
+                    if d_base.weekday() >= 5:
+                        d_base = next_business_day(d_base).normalize()
+
+                else:
+                    d_base = None
+
+                if d_base is not None:
+                    add_if_valid(d_base)
 
                 current = (current + pd.DateOffset(months=step)).normalize()
 
@@ -267,9 +273,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
     return out.sort_values("FECHA").reset_index(drop=True)
 
 def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amount_col: str) -> pd.DataFrame:
-    """
-    Calcula COBROS/PAGOS/NETO/SALDO usando amount_col (IMPORTE_PRON o IMPORTE_REAL).
-    """
     df = df.copy()
     df["COBROS"] = df.apply(lambda x: x[amount_col] if x["TIPO"] == "INGRESO" else 0.0, axis=1)
     df["PAGOS"] = df.apply(lambda x: x[amount_col] if x["TIPO"] == "GASTO" else 0.0, axis=1)
@@ -325,7 +328,10 @@ start_ts = pd.Timestamp(saldo_fecha).normalize()
 generated = generate_events_from_catalog(catalog=catalog, start_date=start_ts, months_horizon=months_horizon)
 
 if dedupe_exact and not generated.empty:
-    generated = generated.drop_duplicates(subset=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_PRON", "IMPORTE_REAL"], keep="first")
+    generated = generated.drop_duplicates(
+        subset=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_PRON", "IMPORTE_REAL"],
+        keep="first"
+    )
 
 if generated.empty:
     st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / VALOR_FECHA / HASTA).")
@@ -349,14 +355,13 @@ base_filtered = generated[
 
 base_filtered = base_filtered.sort_values("FECHA").reset_index(drop=True)
 
-# Pronosticado (para tablas / tesorería)
+# Pronosticado
 consolidado_pron = compute_balance_from_amount(base_filtered, float(saldo_hoy), "IMPORTE_PRON")
-
-# Real (solo para gráfico comparativo)
+# Real
 consolidado_real = compute_balance_from_amount(base_filtered, float(saldo_hoy), "IMPORTE_REAL")
 
-# Añadir fila inicial en ambos
-base_row_pron = pd.DataFrame([{
+# Fila saldo inicial
+base_row = pd.DataFrame([{
     "FECHA": start_ts,
     "CONCEPTO": "SALDO BANCOS TOTAL",
     "TIPO": "SALDO",
@@ -370,8 +375,8 @@ base_row_pron = pd.DataFrame([{
     "SALDO": float(saldo_hoy)
 }])
 
-consolidado_pron2 = pd.concat([base_row_pron, consolidado_pron], ignore_index=True)
-consolidado_real2 = pd.concat([base_row_pron, consolidado_real], ignore_index=True)
+consolidado_pron2 = pd.concat([base_row, consolidado_pron], ignore_index=True)
+consolidado_real2 = pd.concat([base_row, consolidado_real], ignore_index=True)
 
 # -----------------------------
 # Buscador + rango fechas (solo visualización)
@@ -403,7 +408,7 @@ if q:
 view_df = view_df.sort_values("FECHA").reset_index(drop=True)
 
 # -----------------------------
-# KPIs (base filtros)
+# KPIs
 # -----------------------------
 c1, c2, c3, c4 = st.columns(4)
 with c1:
@@ -420,29 +425,28 @@ with c4:
 # -----------------------------
 st.subheader("Evolución de saldo — diario (Pronosticado vs Real)")
 
-# Serie diaria PRON
+# Diario PRON (last del día)
 d_pron = consolidado_pron2[["FECHA", "SALDO"]].copy()
 d_pron["FECHA"] = pd.to_datetime(d_pron["FECHA"]).dt.normalize()
 d_pron = d_pron.groupby("FECHA", as_index=False)["SALDO"].last().rename(columns={"SALDO": "SALDO_PRON"})
 
-# Serie diaria REAL
+# Diario REAL
 d_real = consolidado_real2[["FECHA", "SALDO"]].copy()
 d_real["FECHA"] = pd.to_datetime(d_real["FECHA"]).dt.normalize()
 d_real = d_real.groupby("FECHA", as_index=False)["SALDO"].last().rename(columns={"SALDO": "SALDO_REAL"})
 
 daily = pd.merge(d_pron, d_real, on="FECHA", how="outer").sort_values("FECHA")
 
+# Relleno diario continuo
 all_days = pd.date_range(start=daily["FECHA"].min(), end=daily["FECHA"].max(), freq="D")
 daily = daily.set_index("FECHA").reindex(all_days).rename_axis("FECHA").reset_index()
-
 daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(float(saldo_hoy))
 daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(float(saldo_hoy))
 
 # Zoom: rango visible
-zoom_start = pd.Timestamp(d_from) - pd.Timedelta(days=1)
+zoom_start = pd.Timestamp(d_from)
 zoom_end = pd.Timestamp(d_to)
 daily_zoom = daily[(daily["FECHA"] >= zoom_start) & (daily["FECHA"] <= zoom_end)].copy()
-daily_zoom = daily_zoom[daily_zoom["FECHA"] >= pd.Timestamp(d_from)].copy()
 
 plot_df = daily_zoom.melt(
     id_vars=["FECHA"],
@@ -470,13 +474,12 @@ chart = (
 st.altair_chart(chart, use_container_width=True)
 
 # -----------------------------
-# Movimientos (formato tesorería) — SOLO PRON (como antes)
+# Movimientos (formato tesorería) — PRON
 # -----------------------------
 st.subheader("Movimientos (formato tesorería)")
 
 mov = view_df.copy()
 mov["VTO. PAGO"] = mov["FECHA"].dt.strftime("%d-%m-%y")
-
 mov_out = mov[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO"]].copy()
 
 styled_mov = (
@@ -487,25 +490,32 @@ styled_mov = (
 st.dataframe(styled_mov, use_container_width=True)
 
 # -----------------------------
-# Resumen mensual (visible) — SOLO PRON
+# Resumen mensual: COBROS/PAGOS/NETO según lo visible + SALDO_CIERRE GLOBAL
 # -----------------------------
 st.subheader("Resumen mensual (según lo visible)")
 
 tmp = view_df.copy()
 tmp["MES"] = tmp["FECHA"].dt.to_period("M").astype(str)
 
-monthly = tmp.groupby("MES", as_index=False).agg(
+monthly_visible = tmp.groupby("MES", as_index=False).agg(
     COBROS=("COBROS", "sum"),
     PAGOS=("PAGOS", "sum"),
     NETO=("NETO", "sum"),
+)
+
+glob = consolidado_pron2.copy()
+glob["MES"] = glob["FECHA"].dt.to_period("M").astype(str)
+monthly_global_close = glob.groupby("MES", as_index=False).agg(
     SALDO_CIERRE=("SALDO", "last")
 )
+
+monthly = monthly_visible.merge(monthly_global_close, on="MES", how="left")
 
 styled_month = monthly.style.format({c: eur for c in monthly.columns if c != "MES"})
 st.dataframe(styled_month, use_container_width=True)
 
 # -----------------------------
-# Exportar a Excel (visible) — SOLO PRON
+# Exportar a Excel (lo visible)
 # -----------------------------
 st.subheader("Exportar (lo visible)")
 
