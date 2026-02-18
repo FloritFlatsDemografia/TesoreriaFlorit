@@ -48,18 +48,19 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Faltan columnas requeridas: {missing}. Columnas detectadas: {list(df.columns)}")
 
-    # Importe pronosticado / real
-    # Permitimos varias formas de nombre
-    if "IMPORTE PRONOSTICADO" not in df.columns and "IMPORTE_PRONOSTICADO" in df.columns:
-        df["IMPORTE PRONOSTICADO"] = df["IMPORTE_PRONOSTICADO"]
-    if "IMPORTE REAL" not in df.columns and "IMPORTE_REAL" in df.columns:
-        df["IMPORTE REAL"] = df["IMPORTE_REAL"]
-
+    # Asegurar columnas de importes
     if "IMPORTE PRONOSTICADO" not in df.columns:
-        raise ValueError("Falta columna: 'IMPORTE PRONOSTICADO'")
+        if "IMPORTE_PRONOSTICADO" in df.columns:
+            df["IMPORTE PRONOSTICADO"] = df["IMPORTE_PRONOSTICADO"]
+        else:
+            raise ValueError("Falta columna: 'IMPORTE PRONOSTICADO'")
+
     if "IMPORTE REAL" not in df.columns:
-        # si no existe, la creamos en 0 para no romper nada
-        df["IMPORTE REAL"] = 0.0
+        # si no existe, la creamos vacía (0) para no romper
+        if "IMPORTE_REAL" in df.columns:
+            df["IMPORTE REAL"] = df["IMPORTE_REAL"]
+        else:
+            df["IMPORTE REAL"] = 0.0
 
     # HASTA opcional
     if "HASTA" not in df.columns:
@@ -188,7 +189,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 year += 1
             continue
 
-        # SEMANAL
+        # SEMANAL (semanas del mes del anchor, o hasta HASTA)
         if periodicidad == "SEMANAL":
             anchor = r.get("FECHA_FIJA")
             if pd.isna(anchor):
@@ -210,7 +211,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 d = d + pd.Timedelta(days=7)
             continue
 
-        # POR MESES
+        # Por meses
         if periodicidad in ("MENSUAL", "BIMESTRAL", "BIMENSUAL", "TRIMESTRAL", "SEMESTRAL"):
             step = months_step_from_periodicidad(periodicidad)
 
@@ -265,21 +266,15 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
 
     return out.sort_values("FECHA").reset_index(drop=True)
 
-def compute_balance_dual(df: pd.DataFrame, starting_balance: float) -> pd.DataFrame:
+def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amount_col: str) -> pd.DataFrame:
+    """
+    Calcula COBROS/PAGOS/NETO/SALDO usando amount_col (IMPORTE_PRON o IMPORTE_REAL).
+    """
     df = df.copy()
-
-    # Pronosticado
-    df["COBROS_PRON"] = df.apply(lambda x: x["IMPORTE_PRON"] if x["TIPO"] == "INGRESO" else 0.0, axis=1)
-    df["PAGOS_PRON"] = df.apply(lambda x: x["IMPORTE_PRON"] if x["TIPO"] == "GASTO" else 0.0, axis=1)
-    df["NETO_PRON"] = df["COBROS_PRON"] - df["PAGOS_PRON"]
-    df["SALDO_PRON"] = starting_balance + df["NETO_PRON"].cumsum()
-
-    # Real
-    df["COBROS_REAL"] = df.apply(lambda x: x["IMPORTE_REAL"] if x["TIPO"] == "INGRESO" else 0.0, axis=1)
-    df["PAGOS_REAL"] = df.apply(lambda x: x["IMPORTE_REAL"] if x["TIPO"] == "GASTO" else 0.0, axis=1)
-    df["NETO_REAL"] = df["COBROS_REAL"] - df["PAGOS_REAL"]
-    df["SALDO_REAL"] = starting_balance + df["NETO_REAL"].cumsum()
-
+    df["COBROS"] = df.apply(lambda x: x[amount_col] if x["TIPO"] == "INGRESO" else 0.0, axis=1)
+    df["PAGOS"] = df.apply(lambda x: x[amount_col] if x["TIPO"] == "GASTO" else 0.0, axis=1)
+    df["NETO"] = df["COBROS"] - df["PAGOS"]
+    df["SALDO"] = starting_balance + df["NETO"].cumsum()
     return df
 
 # -----------------------------
@@ -354,11 +349,14 @@ base_filtered = generated[
 
 base_filtered = base_filtered.sort_values("FECHA").reset_index(drop=True)
 
-# Saldo dual (pron y real)
-consolidado = compute_balance_dual(base_filtered, float(saldo_hoy))
+# Pronosticado (para tablas / tesorería)
+consolidado_pron = compute_balance_from_amount(base_filtered, float(saldo_hoy), "IMPORTE_PRON")
 
-# Fila inicial saldo
-base_row = pd.DataFrame([{
+# Real (solo para gráfico comparativo)
+consolidado_real = compute_balance_from_amount(base_filtered, float(saldo_hoy), "IMPORTE_REAL")
+
+# Añadir fila inicial en ambos
+base_row_pron = pd.DataFrame([{
     "FECHA": start_ts,
     "CONCEPTO": "SALDO BANCOS TOTAL",
     "TIPO": "SALDO",
@@ -366,14 +364,14 @@ base_row = pd.DataFrame([{
     "IMPORTE_PRON": 0.0,
     "IMPORTE_REAL": 0.0,
     "NATURALEZA": "SALDO",
-    "COBROS_PRON": 0.0, "PAGOS_PRON": 0.0, "NETO_PRON": 0.0, "SALDO_PRON": float(saldo_hoy),
-    "COBROS_REAL": 0.0, "PAGOS_REAL": 0.0, "NETO_REAL": 0.0, "SALDO_REAL": float(saldo_hoy),
+    "COBROS": 0.0,
+    "PAGOS": 0.0,
+    "NETO": 0.0,
+    "SALDO": float(saldo_hoy)
 }])
 
-consolidado2 = pd.concat([base_row, consolidado], ignore_index=True)
-consolidado2["_ORD"] = 1
-consolidado2.loc[0, "_ORD"] = 0
-consolidado2 = consolidado2.sort_values(["FECHA", "_ORD"]).drop(columns=["_ORD"]).reset_index(drop=True)
+consolidado_pron2 = pd.concat([base_row_pron, consolidado_pron], ignore_index=True)
+consolidado_real2 = pd.concat([base_row_pron, consolidado_real], ignore_index=True)
 
 # -----------------------------
 # Buscador + rango fechas (solo visualización)
@@ -381,8 +379,8 @@ consolidado2 = consolidado2.sort_values(["FECHA", "_ORD"]).drop(columns=["_ORD"]
 st.sidebar.header("Búsqueda y rango (solo visualización)")
 q = st.sidebar.text_input("Buscar concepto", value="").strip()
 
-min_d = consolidado2["FECHA"].min().date()
-max_d = consolidado2["FECHA"].max().date()
+min_d = consolidado_pron2["FECHA"].min().date()
+max_d = consolidado_pron2["FECHA"].max().date()
 
 date_range = st.sidebar.date_input(
     "Rango de fechas",
@@ -396,7 +394,7 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
 else:
     d_from, d_to = min_d, max_d
 
-view_df = consolidado2.copy()
+view_df = consolidado_pron2.copy()
 view_df = view_df[(view_df["FECHA"].dt.date >= d_from) & (view_df["FECHA"].dt.date <= d_to)].copy()
 
 if q:
@@ -405,30 +403,34 @@ if q:
 view_df = view_df.sort_values("FECHA").reset_index(drop=True)
 
 # -----------------------------
-# KPIs (pronosticado vs real)
+# KPIs (base filtros)
 # -----------------------------
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("Saldo inicial (hoy)", eur(saldo_hoy))
 with c2:
-    st.metric("Neto periodo (PRON)", eur(consolidado["NETO_PRON"].sum()))
+    st.metric("Neto periodo (PRON)", eur(consolidado_pron["NETO"].sum()))
 with c3:
-    st.metric("Saldo final (PRON)", eur(consolidado["SALDO_PRON"].iloc[-1]))
+    st.metric("Saldo final (PRON)", eur(consolidado_pron["SALDO"].iloc[-1]))
 with c4:
-    st.metric("Saldo final (REAL)", eur(consolidado["SALDO_REAL"].iloc[-1]))
+    st.metric("Saldo final (REAL)", eur(consolidado_real["SALDO"].iloc[-1]))
 
 # -----------------------------
-# Gráfico diario doble (PRON vs REAL) + zoom al rango visible
+# Gráfico diario doble (PRON vs REAL) con zoom al rango visible
 # -----------------------------
 st.subheader("Evolución de saldo — diario (Pronosticado vs Real)")
 
-# Serie diaria con 2 saldos
-daily = consolidado2[["FECHA", "SALDO_PRON", "SALDO_REAL"]].copy()
-daily["FECHA"] = pd.to_datetime(daily["FECHA"]).dt.normalize()
-daily = daily.groupby("FECHA", as_index=False).agg(
-    SALDO_PRON=("SALDO_PRON", "last"),
-    SALDO_REAL=("SALDO_REAL", "last"),
-)
+# Serie diaria PRON
+d_pron = consolidado_pron2[["FECHA", "SALDO"]].copy()
+d_pron["FECHA"] = pd.to_datetime(d_pron["FECHA"]).dt.normalize()
+d_pron = d_pron.groupby("FECHA", as_index=False)["SALDO"].last().rename(columns={"SALDO": "SALDO_PRON"})
+
+# Serie diaria REAL
+d_real = consolidado_real2[["FECHA", "SALDO"]].copy()
+d_real["FECHA"] = pd.to_datetime(d_real["FECHA"]).dt.normalize()
+d_real = d_real.groupby("FECHA", as_index=False)["SALDO"].last().rename(columns={"SALDO": "SALDO_REAL"})
+
+daily = pd.merge(d_pron, d_real, on="FECHA", how="outer").sort_values("FECHA")
 
 all_days = pd.date_range(start=daily["FECHA"].min(), end=daily["FECHA"].max(), freq="D")
 daily = daily.set_index("FECHA").reindex(all_days).rename_axis("FECHA").reset_index()
@@ -436,24 +438,19 @@ daily = daily.set_index("FECHA").reindex(all_days).rename_axis("FECHA").reset_in
 daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(float(saldo_hoy))
 daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(float(saldo_hoy))
 
-# Zoom
+# Zoom: rango visible
 zoom_start = pd.Timestamp(d_from) - pd.Timedelta(days=1)
 zoom_end = pd.Timestamp(d_to)
 daily_zoom = daily[(daily["FECHA"] >= zoom_start) & (daily["FECHA"] <= zoom_end)].copy()
 daily_zoom = daily_zoom[daily_zoom["FECHA"] >= pd.Timestamp(d_from)].copy()
 
-# Long format para Altair
 plot_df = daily_zoom.melt(
     id_vars=["FECHA"],
     value_vars=["SALDO_PRON", "SALDO_REAL"],
     var_name="SERIE",
     value_name="SALDO"
 )
-
-plot_df["SERIE"] = plot_df["SERIE"].map({
-    "SALDO_PRON": "Pronosticado",
-    "SALDO_REAL": "Real"
-})
+plot_df["SERIE"] = plot_df["SERIE"].map({"SALDO_PRON": "Pronosticado", "SALDO_REAL": "Real"})
 
 chart = (
     alt.Chart(plot_df)
@@ -470,45 +467,27 @@ chart = (
     )
     .properties(height=340)
 )
-
 st.altair_chart(chart, use_container_width=True)
 
 # -----------------------------
-# Movimientos formato tesorería (mostramos PRON; y añadimos REAL aparte)
+# Movimientos (formato tesorería) — SOLO PRON (como antes)
 # -----------------------------
 st.subheader("Movimientos (formato tesorería)")
 
 mov = view_df.copy()
 mov["VTO. PAGO"] = mov["FECHA"].dt.strftime("%d-%m-%y")
 
-mov_out = mov[[
-    "VTO. PAGO", "CONCEPTO",
-    "COBROS_PRON", "PAGOS_PRON", "SALDO_PRON",
-    "COBROS_REAL", "PAGOS_REAL", "SALDO_REAL"
-]].copy()
-
-mov_out = mov_out.rename(columns={
-    "COBROS_PRON": "COBROS (PRON)",
-    "PAGOS_PRON": "PAGOS (PRON)",
-    "SALDO_PRON": "SALDO (PRON)",
-    "COBROS_REAL": "COBROS (REAL)",
-    "PAGOS_REAL": "PAGOS (REAL)",
-    "SALDO_REAL": "SALDO (REAL)",
-})
+mov_out = mov[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO"]].copy()
 
 styled_mov = (
     mov_out.style
-    .applymap(color_saldo, subset=["SALDO (PRON)", "SALDO (REAL)"])
-    .format({
-        "COBROS (PRON)": eur, "PAGOS (PRON)": eur, "SALDO (PRON)": eur,
-        "COBROS (REAL)": eur, "PAGOS (REAL)": eur, "SALDO (REAL)": eur,
-    })
+    .applymap(color_saldo, subset=["SALDO"])
+    .format({"COBROS": eur, "PAGOS": eur, "SALDO": eur})
 )
-
 st.dataframe(styled_mov, use_container_width=True)
 
 # -----------------------------
-# Resumen mensual (visible) PRON y REAL
+# Resumen mensual (visible) — SOLO PRON
 # -----------------------------
 st.subheader("Resumen mensual (según lo visible)")
 
@@ -516,44 +495,27 @@ tmp = view_df.copy()
 tmp["MES"] = tmp["FECHA"].dt.to_period("M").astype(str)
 
 monthly = tmp.groupby("MES", as_index=False).agg(
-    COBROS_PRON=("COBROS_PRON", "sum"),
-    PAGOS_PRON=("PAGOS_PRON", "sum"),
-    NETO_PRON=("NETO_PRON", "sum"),
-    SALDO_CIERRE_PRON=("SALDO_PRON", "last"),
-    COBROS_REAL=("COBROS_REAL", "sum"),
-    PAGOS_REAL=("PAGOS_REAL", "sum"),
-    NETO_REAL=("NETO_REAL", "sum"),
-    SALDO_CIERRE_REAL=("SALDO_REAL", "last"),
+    COBROS=("COBROS", "sum"),
+    PAGOS=("PAGOS", "sum"),
+    NETO=("NETO", "sum"),
+    SALDO_CIERRE=("SALDO", "last")
 )
-
-monthly = monthly.rename(columns={
-    "COBROS_PRON": "COBROS (PRON)",
-    "PAGOS_PRON": "PAGOS (PRON)",
-    "NETO_PRON": "NETO (PRON)",
-    "SALDO_CIERRE_PRON": "SALDO_CIERRE (PRON)",
-    "COBROS_REAL": "COBROS (REAL)",
-    "PAGOS_REAL": "PAGOS (REAL)",
-    "NETO_REAL": "NETO (REAL)",
-    "SALDO_CIERRE_REAL": "SALDO_CIERRE (REAL)",
-})
 
 styled_month = monthly.style.format({c: eur for c in monthly.columns if c != "MES"})
 st.dataframe(styled_month, use_container_width=True)
 
 # -----------------------------
-# Exportar a Excel (visible)
+# Exportar a Excel (visible) — SOLO PRON
 # -----------------------------
 st.subheader("Exportar (lo visible)")
 
 export_mov = mov_out.copy()
-for c in export_mov.columns:
-    if c not in ["VTO. PAGO", "CONCEPTO"]:
-        export_mov[c] = pd.to_numeric(export_mov[c], errors="coerce")
+for c in ["COBROS", "PAGOS", "SALDO"]:
+    export_mov[c] = pd.to_numeric(export_mov[c], errors="coerce")
 
 export_month = monthly.copy()
-for c in export_month.columns:
-    if c != "MES":
-        export_month[c] = pd.to_numeric(export_month[c], errors="coerce")
+for c in ["COBROS", "PAGOS", "NETO", "SALDO_CIERRE"]:
+    export_month[c] = pd.to_numeric(export_month[c], errors="coerce")
 
 def build_excel_bytes(df_mov: pd.DataFrame, df_month: pd.DataFrame) -> bytes:
     bio = BytesIO()
