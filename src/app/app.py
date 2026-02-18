@@ -167,7 +167,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 return False
             return True
 
-        # PUNTUAL
         if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF"):
             if pd.isna(r.get("FECHA_FIJA")):
                 continue
@@ -177,7 +176,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 rows.append((d, r))
             continue
 
-        # ANUAL
         if periodicidad == "ANUAL":
             if pd.isna(r.get("FECHA_FIJA")):
                 continue
@@ -193,7 +191,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 year += 1
             continue
 
-        # SEMANAL
         if periodicidad == "SEMANAL":
             anchor = r.get("FECHA_FIJA")
             if pd.isna(anchor):
@@ -215,7 +212,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 d = d + pd.Timedelta(days=7)
             continue
 
-        # PERIODICIDADES POR MESES
         if periodicidad in ("MENSUAL", "BIMESTRAL", "BIMENSUAL", "TRIMESTRAL", "SEMESTRAL"):
             step = months_step_from_periodicidad(periodicidad)
 
@@ -255,8 +251,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
 
                 current = (current + pd.DateOffset(months=step)).normalize()
 
-            continue
-
     if not rows:
         return pd.DataFrame(columns=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE", "NATURALEZA"])
 
@@ -280,7 +274,7 @@ def compute_balance(df: pd.DataFrame, starting_balance: float) -> pd.DataFrame:
     return df
 
 # -----------------------------
-# Formatting helpers (2 decimales + €)
+# Formatting helpers
 # -----------------------------
 def eur(x):
     try:
@@ -351,10 +345,10 @@ base_filtered = generated[
 
 base_filtered = base_filtered.sort_values("FECHA").reset_index(drop=True)
 
-# Saldo REAL (no depende del buscador ni del rango de fechas, MODO 1)
+# Saldo REAL (no depende de buscador/rango)
 consolidado = compute_balance(base_filtered, float(saldo_hoy))
 
-# Insertar fila inicial tipo Excel: SALDO BANCOS TOTAL
+# Insertar fila inicial: SALDO BANCOS TOTAL
 base_row = pd.DataFrame([{
     "FECHA": start_ts,
     "CONCEPTO": "SALDO BANCOS TOTAL",
@@ -374,7 +368,7 @@ consolidado2.loc[0, "_ORD"] = 0
 consolidado2 = consolidado2.sort_values(["FECHA", "_ORD"]).drop(columns=["_ORD"]).reset_index(drop=True)
 
 # -----------------------------
-# Buscador + rango fechas (MODO 1: solo visualización)
+# Buscador + rango fechas (solo visualización)
 # -----------------------------
 st.sidebar.header("Búsqueda y rango (solo visualización)")
 q = st.sidebar.text_input("Buscar concepto", value="").strip()
@@ -395,18 +389,15 @@ else:
     d_from, d_to = min_d, max_d
 
 view_df = consolidado2.copy()
-
-# aplicar rango
 view_df = view_df[(view_df["FECHA"].dt.date >= d_from) & (view_df["FECHA"].dt.date <= d_to)].copy()
 
-# aplicar buscador (solo CONCEPTO)
 if q:
     view_df = view_df[view_df["CONCEPTO"].astype(str).str.contains(q, case=False, na=False)].copy()
 
 view_df = view_df.sort_values("FECHA").reset_index(drop=True)
 
 # -----------------------------
-# Dashboard (siempre saldo real)
+# Dashboard
 # -----------------------------
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -417,14 +408,12 @@ with c3:
     st.metric("Saldo final forecast (filtros base)", eur(consolidado["SALDO"].iloc[-1]))
 
 # -----------------------------
-# Gráfico diario (saldo real)
+# Gráfico diario (saldo real) PERO ZOOM al rango visible
 # -----------------------------
-st.subheader("Evolución de saldo (saldo real) — diario")
+st.subheader("Evolución de saldo (saldo real) — diario (zoom rango visible)")
 
 saldo_daily = consolidado2[["FECHA", "SALDO"]].copy()
 saldo_daily["FECHA"] = pd.to_datetime(saldo_daily["FECHA"]).dt.normalize()
-
-# si hay varias filas el mismo día, nos quedamos con el último saldo del día
 saldo_daily = saldo_daily.groupby("FECHA", as_index=False)["SALDO"].last()
 
 all_days = pd.date_range(
@@ -438,14 +427,21 @@ saldo_daily = (
     .reindex(all_days)
     .rename_axis("FECHA")
 )
-
 saldo_daily["SALDO"] = saldo_daily["SALDO"].ffill()
 saldo_daily["SALDO"] = saldo_daily["SALDO"].fillna(float(saldo_hoy))
 
-st.line_chart(saldo_daily[["SALDO"]])
+# ZOOM: incluimos el día anterior para que el primer día del rango tenga el saldo correcto por ffill
+zoom_start = pd.Timestamp(d_from) - pd.Timedelta(days=1)
+zoom_end = pd.Timestamp(d_to)
+
+saldo_zoom = saldo_daily.loc[(saldo_daily.index >= zoom_start) & (saldo_daily.index <= zoom_end)].copy()
+# quitamos el día previo del plot si no lo quieres visualizar:
+saldo_zoom_plot = saldo_zoom.loc[saldo_zoom.index >= pd.Timestamp(d_from)]
+
+st.line_chart(saldo_zoom_plot[["SALDO"]])
 
 # -----------------------------
-# Movimientos formato tesorería (sin PREVISION, saldo coloreado, 2 decimales + €)
+# Movimientos formato tesorería
 # -----------------------------
 st.subheader("Movimientos (formato tesorería)")
 
@@ -457,17 +453,13 @@ mov_out = mov[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO"]].copy()
 styled_mov = (
     mov_out.style
     .applymap(color_saldo, subset=["SALDO"])
-    .format({
-        "COBROS": eur,
-        "PAGOS": eur,
-        "SALDO": eur,
-    })
+    .format({"COBROS": eur, "PAGOS": eur, "SALDO": eur})
 )
 
 st.dataframe(styled_mov, use_container_width=True)
 
 # -----------------------------
-# Resumen mensual (sobre lo visible)
+# Resumen mensual (visible)
 # -----------------------------
 st.subheader("Resumen mensual (según lo visible)")
 
@@ -482,20 +474,15 @@ monthly = tmp.groupby("MES", as_index=False).agg(
 )
 
 styled_month = monthly.style.format({
-    "COBROS": eur,
-    "PAGOS": eur,
-    "NETO": eur,
-    "SALDO_CIERRE": eur,
+    "COBROS": eur, "PAGOS": eur, "NETO": eur, "SALDO_CIERRE": eur
 })
-
 st.dataframe(styled_month, use_container_width=True)
 
 # -----------------------------
-# Exportar a Excel (lo visible)
+# Exportar a Excel (visible)
 # -----------------------------
 st.subheader("Exportar (lo visible)")
 
-# Datos exportables (numéricos, sin €)
 export_mov = mov_out.copy()
 for c in ["COBROS", "PAGOS", "SALDO"]:
     export_mov[c] = pd.to_numeric(export_mov[c], errors="coerce")
