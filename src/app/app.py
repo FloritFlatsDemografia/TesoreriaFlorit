@@ -13,16 +13,23 @@ st.title("APP Tesorería — Dashboard")
 # Helpers
 # -----------------------------
 
-# Columnas mínimas realmente necesarias para generar eventos
+# Columnas mínimas necesarias para generar eventos
 MIN_REQUIRED = [
-    "GENERAL", "TIPO", "DEPARTAMENTO", "IMPORTE",
+    "GENERAL", "TIPO", "DEPARTAMENTO",
     "NATURALEZA", "PERIODICIDAD",
     "REGLA_FECHA", "VALOR_FECHA",
     "LAG", "AJUSTE FINDE"
 ]
 
-# Alias para compatibilidad entre nombres (tu Excel puede variar)
+# Alias de nombres entre versiones de Excel
 COL_ALIASES = {
+    # Importes (opción 2: usar IMPORTE PRONOSTICADO como forecast)
+    "IMPORTE": ["IMPORTE", "IMPORTE PRONOSTICADO", "IMPORTE_PRONOSTICADO"],
+
+    # Hasta (fin de recurrencia)
+    "HASTA": ["HASTA", "FECHA_FIN", "FIN", "HASTA_FECHA"],
+
+    # IVA / variantes
     "IVA_APLICA": ["IVA_APLICA", "IVA_EN_FACTURA"],
     "IMPUESTO_TIPO": ["IMPUESTO_TIPO", "IVA_%", "IVA_PORCENTAJE", "IVA"],
     "MODELO": ["MODELO", "IVA_SENTIDO"],
@@ -48,14 +55,13 @@ def coalesce_column(df: pd.DataFrame, target: str) -> pd.DataFrame:
         if a_u in df.columns:
             df[target_u] = df[a_u]
             return df
-    # Si no existe, no hacemos nada
     return df
 
 def find_header_row(df_raw: pd.DataFrame) -> int | None:
     """
     Encuentra la fila donde están los headers (busca 'GENERAL' y 'TIPO').
     """
-    for i in range(min(40, len(df_raw))):
+    for i in range(min(50, len(df_raw))):
         row = df_raw.iloc[i].astype(str).str.strip().str.upper().tolist()
         if "GENERAL" in row and "TIPO" in row:
             return i
@@ -71,15 +77,19 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df = normalize_cols(df)
 
     # Compatibilidad con variaciones de nombres
-    for target in ["IVA_APLICA", "IMPUESTO_TIPO", "MODELO", "TRATAMIENTO_IVA", "PERIODO_SERVICIO"]:
+    for target in ["IMPORTE", "HASTA", "IVA_APLICA", "IMPUESTO_TIPO", "MODELO", "TRATAMIENTO_IVA", "PERIODO_SERVICIO"]:
         df = coalesce_column(df, target)
 
-    # Comprobación de columnas mínimas
+    # Comprobación mínimas
     missing = [c for c in MIN_REQUIRED if c not in df.columns]
     if missing:
         raise ValueError(f"Faltan columnas requeridas: {missing}. Columnas detectadas: {list(df.columns)}")
 
-    # Limpieza básica
+    # Si aún así IMPORTE no existe (no debería), fallamos claro
+    if "IMPORTE" not in df.columns:
+        raise ValueError(f"Falta columna requerida: 'IMPORTE'. Columnas detectadas: {list(df.columns)}")
+
+    # Limpieza
     df = df.dropna(how="all").copy()
 
     def clean_str(col):
@@ -88,21 +98,17 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
         df[col] = df[col].astype(str).str.strip()
         return df
 
-    df = clean_str("GENERAL")
-    df = clean_str("TIPO")
-    df = clean_str("DEPARTAMENTO")
-    df = clean_str("NATURALEZA")
-    df = clean_str("PERIODICIDAD")
-    df = clean_str("REGLA_FECHA")
-    df = clean_str("AJUSTE FINDE")
+    for c in ["GENERAL", "TIPO", "DEPARTAMENTO", "NATURALEZA", "PERIODICIDAD", "REGLA_FECHA", "AJUSTE FINDE"]:
+        df = clean_str(c)
 
     df["TIPO"] = df["TIPO"].str.upper()
     df["DEPARTAMENTO"] = df["DEPARTAMENTO"].str.upper()
     df["NATURALEZA"] = df["NATURALEZA"].str.upper()
     df["PERIODICIDAD"] = df["PERIODICIDAD"].str.upper()
     df["REGLA_FECHA"] = df["REGLA_FECHA"].str.upper()
+    df["AJUSTE FINDE"] = df["AJUSTE FINDE"].str.upper()
 
-    # IMPORTE numérico (pronóstico)
+    # IMPORTE numérico (forecast)
     df["IMPORTE"] = pd.to_numeric(df["IMPORTE"], errors="coerce").fillna(0.0)
 
     # LAG numérico
@@ -129,10 +135,16 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df["DIA_MES"] = df["VALOR_FECHA"].apply(to_day_of_month)
     df["FECHA_FIJA"] = pd.to_datetime(df["VALOR_FECHA"], errors="coerce").dt.normalize()
 
+    # HASTA: fecha fin de recurrencia (puede estar vacío)
+    if "HASTA" in df.columns:
+        df["HASTA"] = pd.to_datetime(df["HASTA"], errors="coerce").dt.normalize()
+    else:
+        df["HASTA"] = pd.NaT
+
     return df
 
 def next_business_day(d: pd.Timestamp) -> pd.Timestamp:
-    # simplificado: sábado/domingo -> lunes
+    # sáb/dom -> lunes
     if d.weekday() == 5:
         return d + pd.Timedelta(days=2)
     if d.weekday() == 6:
@@ -140,7 +152,6 @@ def next_business_day(d: pd.Timestamp) -> pd.Timestamp:
     return d
 
 def add_business_days(d: pd.Timestamp, n: int) -> pd.Timestamp:
-    # suma n días hábiles (sin festivos, solo finde)
     cur = d
     step = 1 if n >= 0 else -1
     remaining = abs(n)
@@ -160,7 +171,6 @@ def months_step_from_periodicidad(periodicidad: str) -> int:
         return 3
     if p == "SEMESTRAL":
         return 6
-    # por defecto: mensual
     return 1
 
 def generate_events_from_catalog(
@@ -169,17 +179,17 @@ def generate_events_from_catalog(
     months_horizon: int
 ) -> pd.DataFrame:
     """
-    Genera movimientos a futuro desde catálogo:
-    - PUNTUAL: FECHA_FIJA
-    - ANUAL: FECHA_FIJA (mismo día/mes cada año)
-    - SEMANAL: REGLA_FECHA=DIA_SEMANA y VALOR_FECHA=fecha ancla (p.ej primer viernes del mes)
-              Genera cada 7 días, pero SOLO dentro del MES de esa ancla (evita que enero siga en febrero).
-    - Mensuales (MENSUAL/BIMESTRAL/TRIMESTRAL/SEMESTRAL): según regla DIA_MES/ULTIMO_HABIL/FECHA_FIJA
-
-    Ajuste finde: SIG_HABIL
-    Lag: suma días hábiles
+    Soporta:
+    - PUNTUAL (FECHA_FIJA)
+    - ANUAL (FECHA_FIJA)
+    - SEMANAL (DIA_SEMANA, usa VALOR_FECHA como ancla)
+      *si hay HASTA -> genera hasta HASTA
+      *si NO hay HASTA -> genera solo dentro del mes del ancla (útil para tener 1 fila por mes)
+    - MENSUAL/BIMESTRAL/TRIMESTRAL/SEMESTRAL (DIA_MES/ULTIMO_HABIL/FECHA_FIJA)
+    Corta siempre por HASTA si existe.
     """
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
+
     rows = []
 
     for _, r in catalog.iterrows():
@@ -187,6 +197,8 @@ def generate_events_from_catalog(
         regla = str(r.get("REGLA_FECHA", "")).upper().strip()
         ajuste = str(r.get("AJUSTE FINDE", "")).upper().strip()
         lag = int(r.get("LAG", 0))
+        hasta = r.get("HASTA", pd.NaT)
+        hasta = pd.Timestamp(hasta).normalize() if not pd.isna(hasta) else pd.NaT
 
         def apply_adjustments(d: pd.Timestamp) -> pd.Timestamp:
             if ajuste == "SIG_HABIL":
@@ -195,13 +207,20 @@ def generate_events_from_catalog(
                 d = add_business_days(d, lag)
             return d
 
+        def within_limits(d: pd.Timestamp) -> bool:
+            if d < start_date or d > end_date:
+                return False
+            if not pd.isna(hasta) and d > hasta:
+                return False
+            return True
+
         # ---------- PUNTUAL ----------
         if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF"):
             if regla != "FECHA_FIJA" or pd.isna(r.get("FECHA_FIJA")):
                 continue
             d = pd.Timestamp(r["FECHA_FIJA"]).normalize()
             d = apply_adjustments(d)
-            if start_date <= d <= end_date:
+            if within_limits(d):
                 rows.append((d, r))
             continue
 
@@ -215,39 +234,45 @@ def generate_events_from_catalog(
                     if candidate > end_date:
                         break
                     d = apply_adjustments(candidate)
-                    if start_date <= d <= end_date:
+                    if within_limits(d):
                         rows.append((d, r))
                     year += 1
             continue
 
         # ---------- SEMANAL ----------
         if periodicidad == "SEMANAL":
-            # Necesitamos una fecha ancla (VALOR_FECHA como fecha)
             anchor = r.get("FECHA_FIJA")
             if pd.isna(anchor):
-                # si no hay fecha válida, no generamos
                 continue
-
             anchor = pd.Timestamp(anchor).normalize()
 
-            # Generar solo dentro del mes de la ancla (esto evita duplicidades por tener una fila por mes)
-            month_start = anchor.replace(day=1)
-            month_end = (month_start + pd.offsets.MonthEnd(0)).normalize()
+            # Si hay HASTA -> generamos hasta HASTA (o hasta fin de horizonte)
+            if not pd.isna(hasta):
+                stop = min(hasta, end_date)
+            else:
+                # si NO hay HASTA, cortamos al final del mes del anchor (para evitar que ENERO siga en FEBRERO)
+                month_start = anchor.replace(day=1)
+                stop = (month_start + pd.offsets.MonthEnd(0)).normalize()
+                stop = min(stop, end_date)
 
             d = anchor
-            while d <= month_end:
+            while d <= stop:
                 dd = apply_adjustments(d)
-                if start_date <= dd <= end_date:
+                if within_limits(dd):
                     rows.append((dd, r))
                 d = d + pd.Timedelta(days=7)
-
             continue
 
-        # ---------- PERIODICIDADES MENSUALES (incluye bimestral, etc.) ----------
+        # ---------- PERIODICIDADES POR MESES ----------
         step = months_step_from_periodicidad(periodicidad)
 
-        for m in range(0, months_horizon + 1, step):
+        for m in range(0, months_horizon + 1):
             month_start = (start_date + pd.offsets.MonthBegin(m)).normalize()
+
+            # Solo generar en meses que correspondan al step
+            if (m % step) != 0:
+                continue
+
             year = month_start.year
             month = month_start.month
 
@@ -271,7 +296,7 @@ def generate_events_from_catalog(
                 continue
 
             d = apply_adjustments(d)
-            if start_date <= d <= end_date:
+            if within_limits(d):
                 rows.append((d, r))
 
     if not rows:
@@ -329,7 +354,7 @@ generated = generate_events_from_catalog(
 )
 
 if generated.empty:
-    st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / VALOR_FECHA).")
+    st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / VALOR_FECHA / HASTA).")
     st.dataframe(catalog.head(50), use_container_width=True)
     st.stop()
 
