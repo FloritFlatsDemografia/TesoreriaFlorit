@@ -22,11 +22,6 @@ MIN_REQUIRED = [
 COL_ALIASES = {
     "IMPORTE": ["IMPORTE", "IMPORTE PRONOSTICADO", "IMPORTE_PRONOSTICADO"],
     "HASTA": ["HASTA", "FECHA_FIN", "FIN", "HASTA_FECHA"],
-    "IVA_APLICA": ["IVA_APLICA", "IVA_EN_FACTURA"],
-    "IMPUESTO_TIPO": ["IMPUESTO_TIPO", "IVA_%", "IVA_PORCENTAJE", "IVA"],
-    "MODELO": ["MODELO", "IVA_SENTIDO"],
-    "TRATAMIENTO_IVA": ["TRATAMIENTO_IVA", "TRATAMINETO_IVA", "TRATAMIENTO IVA"],
-    "PERIODO_SERVICIO": ["PERIODO_SERVICIO", "PERIODO_SERV.", "PERIODO"]
 }
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -61,7 +56,7 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df = pd.read_excel(uploaded_file, sheet_name=0, header=header_idx, engine="openpyxl")
     df = normalize_cols(df)
 
-    for target in ["IMPORTE", "HASTA", "IVA_APLICA", "IMPUESTO_TIPO", "MODELO", "TRATAMIENTO_IVA", "PERIODO_SERVICIO"]:
+    for target in ["IMPORTE", "HASTA"]:
         df = coalesce_column(df, target)
 
     missing = [c for c in MIN_REQUIRED if c not in df.columns]
@@ -284,58 +279,25 @@ def compute_balance(df: pd.DataFrame, starting_balance: float) -> pd.DataFrame:
     df["SALDO"] = starting_balance + df["NETO"].cumsum()
     return df
 
-def extend_ingresos_from_previous_year_weekly(generated: pd.DataFrame, growth: float, end_date: pd.Timestamp) -> pd.DataFrame:
-    gen = generated.copy()
-    gen["YEAR"] = gen["FECHA"].dt.year
-    gen["MONTH"] = gen["FECHA"].dt.month
+# -----------------------------
+# Formatting helpers (2 decimales + €)
+# -----------------------------
+def eur(x):
+    try:
+        return f"{float(x):,.2f} €"
+    except Exception:
+        return ""
 
-    years = sorted(gen["YEAR"].dropna().unique().tolist())
-    if len(years) < 1:
-        return generated
-
-    base_year = years[0]
-    target_year = base_year + 1
-
-    base_ing = gen[(gen["TIPO"] == "INGRESO") & (gen["YEAR"] == base_year)]
-    if base_ing.empty:
-        return generated
-
-    monthly_base = base_ing.groupby(["MONTH", "DEPARTAMENTO"], as_index=False)["IMPORTE"].sum()
-    monthly_base["IMPORTE"] = monthly_base["IMPORTE"] * float(growth)
-
-    rows = []
-    for _, rr in monthly_base.iterrows():
-        month = int(rr["MONTH"])
-        dept = rr["DEPARTAMENTO"]
-        total_mes = float(rr["IMPORTE"])
-
-        start = pd.Timestamp(year=target_year, month=month, day=1)
-        end = (start + pd.offsets.MonthEnd(0)).normalize()
-        fridays = pd.date_range(start, end, freq="W-FRI")
-        n_viernes = len(fridays)
-        if n_viernes == 0:
-            continue
-
-        importe_viernes = total_mes / n_viernes
-
-        for d in fridays:
-            d = pd.Timestamp(d).normalize()
-            if d > end_date:
-                continue
-            rows.append({
-                "FECHA": d,
-                "CONCEPTO": f"INGRESO AUTO {target_year} (base {base_year})",
-                "TIPO": "INGRESO",
-                "DEPARTAMENTO": dept,
-                "IMPORTE": float(importe_viernes),
-                "NATURALEZA": "AUTO"
-            })
-
-    if not rows:
-        return generated
-
-    gen2 = pd.concat([generated, pd.DataFrame(rows)], ignore_index=True)
-    return gen2.sort_values("FECHA").reset_index(drop=True)
+def color_saldo(v):
+    try:
+        v = float(v)
+    except Exception:
+        return ""
+    if v > 0:
+        return "color: green; font-weight: 700;"
+    if v < 0:
+        return "color: red; font-weight: 700;"
+    return ""
 
 # -----------------------------
 # Sidebar inputs
@@ -344,9 +306,6 @@ st.sidebar.header("Inputs")
 saldo_fecha = st.sidebar.date_input("Fecha del saldo (hoy)", value=date.today())
 saldo_hoy = st.sidebar.number_input("Saldo actual en banco (€)", min_value=-1e12, max_value=1e12, value=0.0, step=100.0)
 months_horizon = st.sidebar.slider("Horizonte forecast (meses)", min_value=1, max_value=36, value=12)
-
-extend_ingresos = st.sidebar.checkbox("Extender INGRESOS usando año anterior (AUTO)", value=True)
-growth = st.sidebar.number_input("Factor crecimiento año extendido", min_value=0.0, max_value=3.0, value=1.00, step=0.01)
 
 dedupe_exact = st.sidebar.checkbox("Eliminar duplicados exactos (red de seguridad)", value=True)
 uploaded = st.sidebar.file_uploader("Sube el Excel de catálogo (xlsx)", type=["xlsx"])
@@ -365,12 +324,7 @@ except Exception as e:
     st.stop()
 
 start_ts = pd.Timestamp(saldo_fecha).normalize()
-end_ts = (start_ts + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
-
 generated = generate_events_from_catalog(catalog=catalog, start_date=start_ts, months_horizon=months_horizon)
-
-if extend_ingresos and not generated.empty:
-    generated = extend_ingresos_from_previous_year_weekly(generated, growth, end_ts)
 
 if dedupe_exact and not generated.empty:
     generated = generated.drop_duplicates(subset=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE"], keep="first")
@@ -420,18 +374,18 @@ consolidado2 = consolidado2.sort_values(["FECHA", "_ORD"]).drop(columns=["_ORD"]
 # -----------------------------
 c1, c2, c3 = st.columns(3)
 with c1:
-    st.metric("Saldo inicial (hoy)", f"{saldo_hoy:,.2f} €")
+    st.metric("Saldo inicial (hoy)", eur(saldo_hoy))
 with c2:
-    st.metric("Neto periodo", f"{consolidado["NETO"].sum():,.2f} €")
+    st.metric("Neto periodo", eur(consolidado["NETO"].sum()))
 with c3:
-    st.metric("Saldo final forecast", f"{consolidado["SALDO"].iloc[-1]:,.2f} €")
+    st.metric("Saldo final forecast", eur(consolidado["SALDO"].iloc[-1]))
 
 st.subheader("Evolución de saldo")
 saldo_series = consolidado2[["FECHA", "SALDO"]].set_index("FECHA")
 st.line_chart(saldo_series)
 
 # -----------------------------
-# Movimientos formato tesorería (sin PREVISION, y SALDO coloreado)
+# Movimientos formato tesorería (sin PREVISION, saldo coloreado, 2 decimales + €)
 # -----------------------------
 st.subheader("Movimientos (formato tesorería)")
 
@@ -440,22 +394,20 @@ view["VTO. PAGO"] = view["FECHA"].dt.strftime("%d-%m-%y")
 
 view_out = view[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO"]].copy()
 
-def color_saldo(v):
-    try:
-        v = float(v)
-    except Exception:
-        return ""
-    if v > 0:
-        return "color: green; font-weight: 700;"
-    if v < 0:
-        return "color: red; font-weight: 700;"
-    return ""
+styled_mov = (
+    view_out.style
+    .applymap(color_saldo, subset=["SALDO"])
+    .format({
+        "COBROS": eur,
+        "PAGOS": eur,
+        "SALDO": eur,
+    })
+)
 
-styled = view_out.style.applymap(color_saldo, subset=["SALDO"])
-st.dataframe(styled, use_container_width=True)
+st.dataframe(styled_mov, use_container_width=True)
 
 # -----------------------------
-# Resumen mensual
+# Resumen mensual (2 decimales + €)
 # -----------------------------
 st.subheader("Resumen mensual")
 
@@ -468,10 +420,21 @@ monthly = tmp.groupby("MES", as_index=False).agg(
     NETO=("NETO", "sum"),
     SALDO_CIERRE=("SALDO", "last")
 )
-st.dataframe(monthly, use_container_width=True)
+
+styled_month = (
+    monthly.style
+    .format({
+        "COBROS": eur,
+        "PAGOS": eur,
+        "NETO": eur,
+        "SALDO_CIERRE": eur,
+    })
+)
+
+st.dataframe(styled_month, use_container_width=True)
 
 # -----------------------------
-# Export
+# Export (CSV numérico sin €)
 # -----------------------------
 st.subheader("Exportar")
 export_df = consolidado2.copy()
