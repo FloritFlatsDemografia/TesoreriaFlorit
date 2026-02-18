@@ -233,8 +233,8 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 base_date = pd.Timestamp(year=y, month=m, day=min(int(day), int(last_day))).normalize()
 
             anchor_day = base_date.day
-
             current = base_date
+
             while current <= end_date:
                 y, m = current.year, current.month
 
@@ -349,7 +349,6 @@ extend_ingresos = st.sidebar.checkbox("Extender INGRESOS usando año anterior (A
 growth = st.sidebar.number_input("Factor crecimiento año extendido", min_value=0.0, max_value=3.0, value=1.00, step=0.01)
 
 dedupe_exact = st.sidebar.checkbox("Eliminar duplicados exactos (red de seguridad)", value=True)
-
 uploaded = st.sidebar.file_uploader("Sube el Excel de catálogo (xlsx)", type=["xlsx"])
 
 # -----------------------------
@@ -423,33 +422,37 @@ c1, c2, c3 = st.columns(3)
 with c1:
     st.metric("Saldo inicial (hoy)", f"{saldo_hoy:,.2f} €")
 with c2:
-    st.metric("Neto periodo", f"{consolidado['NETO'].sum():,.2f} €")
+    st.metric("Neto periodo", f"{consolidado["NETO"].sum():,.2f} €")
 with c3:
-    st.metric("Saldo final forecast", f"{consolidado['SALDO'].iloc[-1]:,.2f} €")
+    st.metric("Saldo final forecast", f"{consolidado["SALDO"].iloc[-1]:,.2f} €")
 
 st.subheader("Evolución de saldo")
 saldo_series = consolidado2[["FECHA", "SALDO"]].set_index("FECHA")
 st.line_chart(saldo_series)
 
 # -----------------------------
-# Movimientos formato tesorería (PREVISION = SALDO cierre del mes)
+# Movimientos formato tesorería (sin PREVISION, y SALDO coloreado)
 # -----------------------------
 st.subheader("Movimientos (formato tesorería)")
 
 view = consolidado2.copy()
 view["VTO. PAGO"] = view["FECHA"].dt.strftime("%d-%m-%y")
-view["MES"] = view["FECHA"].dt.to_period("M").astype(str)
 
-monthly_close = (
-    view.sort_values("FECHA")
-        .groupby("MES", as_index=False)
-        .agg(PREVISION=("SALDO", "last"))
-)
+view_out = view[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO"]].copy()
 
-view = view.merge(monthly_close, on="MES", how="left")
+def color_saldo(v):
+    try:
+        v = float(v)
+    except Exception:
+        return ""
+    if v > 0:
+        return "color: green; font-weight: 700;"
+    if v < 0:
+        return "color: red; font-weight: 700;"
+    return ""
 
-view_out = view[["VTO. PAGO", "CONCEPTO", "COBROS", "PAGOS", "SALDO", "PREVISION"]].copy()
-st.dataframe(view_out, use_container_width=True)
+styled = view_out.style.applymap(color_saldo, subset=["SALDO"])
+st.dataframe(styled, use_container_width=True)
 
 # -----------------------------
 # Resumen mensual
