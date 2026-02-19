@@ -3,21 +3,16 @@ import pandas as pd
 import numpy as np
 import openpyxl
 from datetime import datetime, date, timedelta
-import matplotlib.pyplot as plt
-
 
 # -----------------------------
 # Helpers
 # -----------------------------
 def norm_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza nombres de columnas para que no fallen por espacios."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
-
 def normalize_pagado(v) -> bool:
-    """Detecta pagado a partir de ✓ / ✅ / X / TRUE / 1 / SI / etc."""
     if v is None:
         return False
     if isinstance(v, float) and np.isnan(v):
@@ -25,9 +20,7 @@ def normalize_pagado(v) -> bool:
     s = str(v).strip().lower()
     return s in {"✓", "✅", "x", "si", "sí", "true", "1", "pagado", "ok"}
 
-
 def to_date_safe(v):
-    """Convierte cualquier input a date (o None)."""
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return None
     if isinstance(v, datetime):
@@ -35,22 +28,21 @@ def to_date_safe(v):
     if isinstance(v, date):
         return v
     try:
-        return pd.to_datetime(v, dayfirst=True, errors="coerce").date()
+        d = pd.to_datetime(v, dayfirst=True, errors="coerce")
+        if pd.isna(d):
+            return None
+        return d.date()
     except Exception:
         return None
 
-
 def next_business_day(d: date) -> date:
-    while d.weekday() >= 5:  # 5=sábado, 6=domingo
+    while d.weekday() >= 5:
         d += timedelta(days=1)
     return d
 
-
 def euro_fmt(x: float) -> str:
-    # Formato europeo: punto miles, coma decimales
     s = f"{x:,.2f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".") + " €"
-
 
 # -----------------------------
 # Lectura hoja BANCOS
@@ -93,27 +85,10 @@ def read_bancos_values(excel_file) -> dict:
         "cuenta_efectivo": efectivo,
     }
 
-
 # -----------------------------
 # Construcción series
 # -----------------------------
 def build_series(df: pd.DataFrame, saldo_inicial: float, horizon_months: int):
-    """
-    Genera:
-      - saldo_pronosticado: usando movimientos NO pagados (IMPORTE PRONOSTICADO)
-      - saldo_real: usando movimientos pagados con fecha (IMPORTE REAL en Fecha)
-    Requisitos mínimos:
-      - TIPO (INGRESO/GASTO)
-      - IMPORTE PRONOSTICADO
-      - IMPORTE REAL
-      - VALOR_FECHA (para forecast)
-    Opcionales:
-      - Pagado (tick)
-      - Fecha (fecha real pago)
-      - LAG (días)
-      - AJUSTE FINDE (p.ej. "SIG HABIL")
-    """
-
     df = norm_cols(df)
 
     required = ["TIPO", "IMPORTE PRONOSTICADO", "IMPORTE REAL", "VALOR_FECHA"]
@@ -121,7 +96,7 @@ def build_series(df: pd.DataFrame, saldo_inicial: float, horizon_months: int):
     if missing:
         raise ValueError(f"Faltan columnas obligatorias en CATALOGO_RECURRENTE: {missing}")
 
-    # Columnas opcionales (si no están, las creo)
+    # Columnas opcionales
     if "Pagado" not in df.columns:
         df["Pagado"] = ""
     if "Fecha" not in df.columns:
@@ -143,15 +118,13 @@ def build_series(df: pd.DataFrame, saldo_inicial: float, horizon_months: int):
     df["LAG"] = pd.to_numeric(df["LAG"], errors="coerce").fillna(0).astype(int)
     df["AJUSTE FINDE"] = df["AJUSTE FINDE"].astype(str).str.strip().str.upper()
 
-    # Horizonte diario
+    # Índice diario
     today = date.today()
     start = date(today.year, today.month, 1)
     end = (pd.Timestamp(start) + pd.DateOffset(months=horizon_months)).date()
     idx = pd.date_range(start=start, end=end, freq="D")
 
-    # -----------------------------
-    # PRONOSTICADO (solo pendientes)
-    # -----------------------------
+    # PRONOSTICADO: solo pendientes
     pending = df[~df["Pagado_norm"]].copy()
 
     def calc_plan_date(row):
@@ -159,13 +132,11 @@ def build_series(df: pd.DataFrame, saldo_inicial: float, horizon_months: int):
         if d is None or pd.isna(d):
             return None
         d2 = d + timedelta(days=int(row["LAG"]))
-        # Ajuste si cae en finde
         if row["AJUSTE FINDE"] in {"SIG HABIL", "SIGUIENTE HABIL", "SIG_HABIL", "NEXT_BUSINESS"}:
             d2 = next_business_day(d2)
         return d2
 
     pending["Fecha_plan"] = pending.apply(calc_plan_date, axis=1)
-
     pending["signed_plan"] = np.where(
         pending["TIPO"].eq("INGRESO"),
         pending["IMPORTE PRONOSTICADO"],
@@ -184,11 +155,9 @@ def build_series(df: pd.DataFrame, saldo_inicial: float, horizon_months: int):
         if ts in plan_daily.index:
             plan_daily.loc[ts] += float(v)
 
-    saldo_plan = (saldo_inicial + plan_daily.cumsum()).rename("Pronosticado")
+    saldo_plan = (saldo_inicial + plan_daily.cumsum()).rename("PRONOSTICADO")
 
-    # -----------------------------
-    # REAL (solo pagados con fecha)
-    # -----------------------------
+    # REAL: solo pagados con fecha
     paid = df[df["Pagado_norm"] & df["Fecha_pago"].notna()].copy()
     paid["signed_real"] = np.where(
         paid["TIPO"].eq("INGRESO"),
@@ -204,80 +173,50 @@ def build_series(df: pd.DataFrame, saldo_inicial: float, horizon_months: int):
         if ts in real_daily.index:
             real_daily.loc[ts] += float(v)
 
-    saldo_real = (saldo_inicial + real_daily.cumsum()).rename("Real")
+    saldo_real = (saldo_inicial + real_daily.cumsum()).rename("REAL")
 
     return saldo_plan, saldo_real
 
-
 # -----------------------------
-# Streamlit UI
+# UI
 # -----------------------------
 st.set_page_config(page_title="Tesorería", layout="wide")
 st.title("APP Tesorería")
 
 uploaded = st.file_uploader("Sube tu Excel de Tesorería", type=["xlsx"])
-
 if not uploaded:
     st.info("Sube el Excel para cargar CATALOGO_RECURRENTE y BANCOS.")
     st.stop()
 
 # Leer BANCOS
-try:
-    bancos = read_bancos_values(uploaded)
-except Exception as e:
-    st.error(f"Error leyendo hoja BANCOS: {e}")
-    st.stop()
+bancos = read_bancos_values(uploaded)
 
-# KPI superiores
 c1, c2, c3 = st.columns(3)
 c1.metric("TOTAL BANCOS (saldo inicial)", euro_fmt(bancos["total_bancos"]))
-
-if bancos["cuenta_suplidos"] is None:
-    c2.metric("CUENTA SUPLIDOS (línea fija)", "No definido")
-else:
-    c2.metric("CUENTA SUPLIDOS (línea fija)", euro_fmt(bancos["cuenta_suplidos"]))
-
-if bancos["cuenta_efectivo"] is None:
-    c3.metric("CUENTA DE EFECTIVO (línea fija)", "No definido")
-else:
-    c3.metric("CUENTA DE EFECTIVO (línea fija)", euro_fmt(bancos["cuenta_efectivo"]))
+c2.metric("CUENTA SUPLIDOS (línea fija)", euro_fmt(bancos["cuenta_suplidos"]) if bancos["cuenta_suplidos"] is not None else "No definido")
+c3.metric("CUENTA DE EFECTIVO (línea fija)", euro_fmt(bancos["cuenta_efectivo"]) if bancos["cuenta_efectivo"] is not None else "No definido")
 
 horizon_months = st.slider("Horizonte forecast (meses)", 1, 24, 12)
 
-# Leer CATALOGO_RECURRENTE
-try:
-    df = pd.read_excel(uploaded, sheet_name="CATALOGO_RECURRENTE")
-except Exception as e:
-    st.error(f"Error leyendo hoja CATALOGO_RECURRENTE: {e}")
-    st.stop()
+# Leer catálogo
+df = pd.read_excel(uploaded, sheet_name="CATALOGO_RECURRENTE")
 
-# Construir series
-try:
-    saldo_plan, saldo_real = build_series(df, bancos["total_bancos"], horizon_months)
-except Exception as e:
-    st.error(f"Error construyendo la gráfica: {e}")
-    st.stop()
+# Series
+saldo_plan, saldo_real = build_series(df, bancos["total_bancos"], horizon_months)
 
-# Plot (con colores fijos para líneas horizontales)
-fig, ax = plt.subplots()
-ax.plot(saldo_plan.index, saldo_plan.values, label="Pronosticado")
-ax.plot(saldo_real.index, saldo_real.values, label="Real")
+# DataFrame para gráfica
+chart_df = pd.concat([saldo_plan, saldo_real], axis=1)
 
+# Líneas fijas (constantes) si existen
 if bancos["cuenta_suplidos"] is not None:
-    ax.axhline(bancos["cuenta_suplidos"], linestyle="--", linewidth=1.6, color="orange", label="Cuenta suplidos")
+    chart_df["CUENTA SUPLIDOS"] = bancos["cuenta_suplidos"]
 if bancos["cuenta_efectivo"] is not None:
-    ax.axhline(bancos["cuenta_efectivo"], linestyle="--", linewidth=1.6, color="red", label="Cuenta efectivo")
+    chart_df["CUENTA DE EFECTIVO"] = bancos["cuenta_efectivo"]
 
-ax.set_title("Evolución de saldo: Real vs Pronosticado")
-ax.set_xlabel("Fecha")
-ax.set_ylabel("€")
-ax.grid(True, alpha=0.2)
-ax.legend()
+st.subheader("Evolución de saldo: Real vs Pronosticado")
+st.line_chart(chart_df)
 
-st.pyplot(fig)
-
-# Debug / comprobación
-with st.expander("Comprobación (Pagado / Fecha)"):
+with st.expander("Comprobación Pagado/Fecha"):
     df_dbg = norm_cols(df)
     if "Pagado" in df_dbg.columns:
         df_dbg["Pagado_norm"] = df_dbg["Pagado"].apply(normalize_pagado)
@@ -285,4 +224,4 @@ with st.expander("Comprobación (Pagado / Fecha)"):
         df_dbg["Fecha_pago"] = df_dbg["Fecha"].apply(to_date_safe)
 
     cols_show = [c for c in ["GENERAL", "TIPO", "IMPORTE PRONOSTICADO", "IMPORTE REAL", "Pagado", "Fecha"] if c in df_dbg.columns]
-    st.dataframe(df_dbg[cols_show].head(80))
+    st.dataframe(df_dbg[cols_show].head(100))
