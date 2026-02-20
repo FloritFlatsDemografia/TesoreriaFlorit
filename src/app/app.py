@@ -34,6 +34,13 @@ def find_header_row(df_raw: pd.DataFrame) -> int | None:
             return i
     return None
 
+def is_pagado(v) -> bool:
+    """Acepta ✓ / ✅ / X / SI / TRUE / 1 / OK / PAGADO (case-insensitive)."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return False
+    s = str(v).strip().lower()
+    return s in {"✓", "✅", "x", "si", "sí", "true", "1", "ok", "pagado", "y", "yes"}
+
 def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     raw = pd.read_excel(uploaded_file, sheet_name=0, header=None, engine="openpyxl")
     header_idx = find_header_row(raw)
@@ -46,6 +53,17 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     missing = [c for c in MIN_REQUIRED if c not in df.columns]
     if missing:
         raise ValueError(f"Faltan columnas requeridas: {missing}. Columnas detectadas: {list(df.columns)}")
+
+    # -------- NUEVO: PAGADO + FECHA (opcionales) --------
+    if "PAGADO" not in df.columns:
+        df["PAGADO"] = ""
+    # OJO: tu Excel la llama "FECHA" (fecha de pago). Para no chocar con FECHA de eventos, la renombramos internamente.
+    if "FECHA" in df.columns:
+        df["FECHA_PAGO"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.normalize()
+    else:
+        df["FECHA_PAGO"] = pd.NaT
+
+    df["PAGADO_BOOL"] = df["PAGADO"].apply(is_pagado)
 
     # Importes
     if "IMPORTE PRONOSTICADO" not in df.columns:
@@ -159,7 +177,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
             return d
 
         def within_limits_base(d_base: pd.Timestamp) -> bool:
-            # valida HASTA sobre la fecha base (sin ajustes)
             if d_base < start_date or d_base > end_date:
                 return False
             if not pd.isna(hasta) and d_base > hasta:
@@ -167,7 +184,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
             return True
 
         def within_limits_adjusted(d_adj: pd.Timestamp) -> bool:
-            # tras ajustes, solo recortamos por horizonte general
             return (d_adj >= start_date) and (d_adj <= end_date)
 
         def add_if_valid(d_base: pd.Timestamp):
@@ -245,7 +261,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
 
                 elif regla == "ULTIMO_HABIL":
                     d_base = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).normalize()
-                    # ojo: ULTIMO_HABIL es "base" ya hábil
                     if d_base.weekday() >= 5:
                         d_base = next_business_day(d_base).normalize()
 
@@ -258,7 +273,10 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 current = (current + pd.DateOffset(months=step)).normalize()
 
     if not rows:
-        return pd.DataFrame(columns=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_PRON", "IMPORTE_REAL", "NATURALEZA"])
+        return pd.DataFrame(columns=[
+            "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_PRON", "IMPORTE_REAL", "NATURALEZA",
+            "PAGADO_BOOL", "FECHA_PAGO"
+        ])
 
     out = pd.DataFrame([{
         "FECHA": d,
@@ -267,9 +285,13 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         "DEPARTAMENTO": rr["DEPARTAMENTO"],
         "IMPORTE_PRON": float(rr["IMPORTE_PRON"]),
         "IMPORTE_REAL": float(rr["IMPORTE_REAL"]),
-        "NATURALEZA": rr.get("NATURALEZA", "")
+        "NATURALEZA": rr.get("NATURALEZA", ""),
+        # -------- NUEVO --------
+        "PAGADO_BOOL": bool(rr.get("PAGADO_BOOL", False)),
+        "FECHA_PAGO": rr.get("FECHA_PAGO", pd.NaT),
     } for d, rr in rows])
 
+    out["FECHA_PAGO"] = pd.to_datetime(out["FECHA_PAGO"], errors="coerce").dt.normalize()
     return out.sort_values("FECHA").reset_index(drop=True)
 
 def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amount_col: str) -> pd.DataFrame:
@@ -329,7 +351,7 @@ generated = generate_events_from_catalog(catalog=catalog, start_date=start_ts, m
 
 if dedupe_exact and not generated.empty:
     generated = generated.drop_duplicates(
-        subset=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_PRON", "IMPORTE_REAL"],
+        subset=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_PRON", "IMPORTE_REAL", "PAGADO_BOOL", "FECHA_PAGO"],
         keep="first"
     )
 
@@ -355,10 +377,27 @@ base_filtered = generated[
 
 base_filtered = base_filtered.sort_values("FECHA").reset_index(drop=True)
 
+# -------- NUEVO: PRON solo pendientes (no pagados) --------
+pron_df = base_filtered[~base_filtered["PAGADO_BOOL"]].copy()
+pron_df = pron_df.sort_values("FECHA").reset_index(drop=True)
+
+# -------- NUEVO: REAL solo pagados y con FECHA_PAGO --------
+real_df = base_filtered[base_filtered["PAGADO_BOOL"]].copy()
+real_df = real_df[real_df["FECHA_PAGO"].notna()].copy()
+real_df["FECHA"] = pd.to_datetime(real_df["FECHA_PAGO"]).dt.normalize()
+real_df = real_df.sort_values("FECHA").reset_index(drop=True)
+
+# Aviso: pagados sin fecha
+pagados_sin_fecha = base_filtered[base_filtered["PAGADO_BOOL"] & base_filtered["FECHA_PAGO"].isna()].copy()
+if not pagados_sin_fecha.empty:
+    st.warning("Hay movimientos marcados como PAGADO pero sin FECHA de pago. No entrarán en la línea REAL.")
+    st.dataframe(pagados_sin_fecha[["CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_REAL", "IMPORTE_PRON", "FECHA"]].head(30),
+                 use_container_width=True)
+
 # Pronosticado
-consolidado_pron = compute_balance_from_amount(base_filtered, float(saldo_hoy), "IMPORTE_PRON")
+consolidado_pron = compute_balance_from_amount(pron_df, float(saldo_hoy), "IMPORTE_PRON")
 # Real
-consolidado_real = compute_balance_from_amount(base_filtered, float(saldo_hoy), "IMPORTE_REAL")
+consolidado_real = compute_balance_from_amount(real_df, float(saldo_hoy), "IMPORTE_REAL")
 
 # Fila saldo inicial
 base_row = pd.DataFrame([{
@@ -369,6 +408,8 @@ base_row = pd.DataFrame([{
     "IMPORTE_PRON": 0.0,
     "IMPORTE_REAL": 0.0,
     "NATURALEZA": "SALDO",
+    "PAGADO_BOOL": False,
+    "FECHA_PAGO": pd.NaT,
     "COBROS": 0.0,
     "PAGOS": 0.0,
     "NETO": 0.0,
@@ -414,11 +455,11 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("Saldo inicial (hoy)", eur(saldo_hoy))
 with c2:
-    st.metric("Neto periodo (PRON)", eur(consolidado_pron["NETO"].sum()))
+    st.metric("Neto periodo (PRON, pendientes)", eur(consolidado_pron["NETO"].sum() if not consolidado_pron.empty else 0.0))
 with c3:
-    st.metric("Saldo final (PRON)", eur(consolidado_pron["SALDO"].iloc[-1]))
+    st.metric("Saldo final (PRON, pendientes)", eur(consolidado_pron["SALDO"].iloc[-1] if not consolidado_pron.empty else float(saldo_hoy)))
 with c4:
-    st.metric("Saldo final (REAL)", eur(consolidado_real["SALDO"].iloc[-1]))
+    st.metric("Saldo final (REAL, pagados)", eur(consolidado_real["SALDO"].iloc[-1] if not consolidado_real.empty else float(saldo_hoy)))
 
 # -----------------------------
 # Gráfico diario doble (PRON vs REAL) con zoom al rango visible
@@ -454,7 +495,7 @@ plot_df = daily_zoom.melt(
     var_name="SERIE",
     value_name="SALDO"
 )
-plot_df["SERIE"] = plot_df["SERIE"].map({"SALDO_PRON": "Pronosticado", "SALDO_REAL": "Real"})
+plot_df["SERIE"] = plot_df["SERIE"].map({"SALDO_PRON": "Pronosticado (pendiente)", "SALDO_REAL": "Real (pagado)"})
 
 chart = (
     alt.Chart(plot_df)
@@ -474,9 +515,9 @@ chart = (
 st.altair_chart(chart, use_container_width=True)
 
 # -----------------------------
-# Movimientos (formato tesorería) — PRON
+# Movimientos (formato tesorería) — PRON (pendientes)
 # -----------------------------
-st.subheader("Movimientos (formato tesorería)")
+st.subheader("Movimientos (formato tesorería) — PRON (pendientes)")
 
 mov = view_df.copy()
 mov["VTO. PAGO"] = mov["FECHA"].dt.strftime("%d-%m-%y")
