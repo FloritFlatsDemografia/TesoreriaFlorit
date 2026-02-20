@@ -60,6 +60,23 @@ def color_saldo(v):
         return "color: red; font-weight: 700;"
     return ""
 
+def style_estado_cell(v: str) -> str:
+    """
+    Colorea la CELDA entera de la columna 'COBRADO/PAGADO'
+    - Pendiente: naranja clarito
+    - Cobrado: verde
+    - Pagado: rojo
+    """
+    s = str(v).strip().lower()
+    if s == "pendiente":
+        return "background-color: #FFE8CC; color: #7A3E00; font-weight: 700;"
+    if s == "cobrado":
+        return "background-color: #DFF5E1; color: #0B5D1E; font-weight: 700;"
+    if s == "pagado":
+        return "background-color: #F8D7DA; color: #7A0B17; font-weight: 700;"
+    # fallback
+    return "font-weight: 700;"
+
 # -----------------------------
 # Leer hoja BANCOS
 # -----------------------------
@@ -240,7 +257,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
     """
     Soporta PRORRATEO=DIARIO para filas MENSUALES/BIMESTRALES/...:
     - Se calcula el mes objetivo con la regla habitual (d_base).
-    - Si PRORRATEO=DIARIO, en vez de 1 evento, genera 1 evento por día del mes (días naturales),
+    - Si PRORRATEO=DIARIO, genera 1 evento por día del mes (días naturales),
       repartiendo IMPORTE_PRON e IMPORTE_REAL entre los días del mes.
     """
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
@@ -370,7 +387,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
             while current <= end_date:
                 y, m = current.year, current.month
 
-                if regla in ("DIA_MES", "DIA_MES ", "DIA_MES\t", "FECHA_FIJA"):
+                if regla in ("DIA_MES", "FECHA_FIJA"):
                     last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
                     d_base = pd.Timestamp(year=y, month=m, day=min(int(anchor_day), int(last_day))).normalize()
 
@@ -540,9 +557,7 @@ real_mode = st.sidebar.radio(
 pron_df = base_filtered[~base_filtered["PAGADO_BOOL"]].copy()
 pron_df = pron_df.sort_values("FECHA").reset_index(drop=True)
 
-# REAL:
-# - Estimado: todos los movimientos, usando IMPORTE_REAL (si hay FECHA_PAGO usa esa fecha, si no la prevista)
-# - Ejecutado: solo pagados, usando IMPORTE_REAL y FECHA_PAGO (si falta, cae en la fecha prevista)
+# REAL = IMPORTE_REAL con fecha efectiva (FECHA_PAGO si existe; si no, FECHA prevista)
 real_df = base_filtered.copy()
 real_df["FECHA_EFECTIVA_REAL"] = real_df["FECHA_PAGO"]
 real_df["FECHA_EFECTIVA_REAL"] = real_df["FECHA_EFECTIVA_REAL"].fillna(real_df["FECHA"])
@@ -557,11 +572,9 @@ pagados_sin_fecha = base_filtered[base_filtered["PAGADO_BOOL"] & base_filtered["
 if not pagados_sin_fecha.empty:
     st.info("Info: Hay movimientos marcados como PAGADO pero sin FECHA. Se usarán en REAL con la FECHA prevista.")
 
-# Consolidación de saldos
 consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON") if not pron_df.empty else pd.DataFrame()
 consolidado_real = compute_balance_from_amount(real_df, saldo_hoy, "IMPORTE_REAL") if not real_df.empty else pd.DataFrame()
 
-# Fila saldo inicial
 base_row = pd.DataFrame([{
     "FECHA": start_ts,
     "CONCEPTO": "SALDO BANCOS TOTAL",
@@ -603,14 +616,12 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
 else:
     d_from, d_to = min_d, max_d
 
-# Vista PRON (tabla pron)
 view_pron = consolidado_pron2.copy()
 view_pron = view_pron[(view_pron["FECHA"].dt.date >= d_from) & (view_pron["FECHA"].dt.date <= d_to)].copy()
 if q:
     view_pron = view_pron[view_pron["CONCEPTO"].astype(str).str.contains(q, case=False, na=False)].copy()
 view_pron = view_pron.sort_values("FECHA").reset_index(drop=True)
 
-# Vista REAL (tabla real)
 view_real = consolidado_real2.copy()
 view_real = view_real[(view_real["FECHA"].dt.date >= d_from) & (view_real["FECHA"].dt.date <= d_to)].copy()
 if q:
@@ -628,39 +639,36 @@ with c2:
 with c3:
     st.metric("Saldo final (PRON, pendientes)", eur(consolidado_pron2["SALDO"].iloc[-1] if not consolidado_pron2.empty else saldo_hoy))
 with c4:
-    st.metric(f"Saldo final (REAL, { 'ejecutado' if real_mode.startswith('Ejecutado') else 'estimado' })",
-              eur(consolidado_real2["SALDO"].iloc[-1] if not consolidado_real2.empty else saldo_hoy))
+    st.metric(
+        f"Saldo final (REAL, {'ejecutado' if real_mode.startswith('Ejecutado') else 'estimado'})",
+        eur(consolidado_real2["SALDO"].iloc[-1] if not consolidado_real2.empty else saldo_hoy)
+    )
 
 # -----------------------------
 # Gráfico diario (PRON vs REAL) + líneas fijas
 # -----------------------------
 st.subheader("Evolución de saldo — diario (Pronosticado vs Real)")
 
-# Diario PRON (last del día)
 d_pron = consolidado_pron2[["FECHA", "SALDO"]].copy()
 d_pron["FECHA"] = pd.to_datetime(d_pron["FECHA"]).dt.normalize()
 d_pron = d_pron.groupby("FECHA", as_index=False)["SALDO"].last().rename(columns={"SALDO": "SALDO_PRON"})
 
-# Diario REAL
 d_real = consolidado_real2[["FECHA", "SALDO"]].copy()
 d_real["FECHA"] = pd.to_datetime(d_real["FECHA"]).dt.normalize()
 d_real = d_real.groupby("FECHA", as_index=False)["SALDO"].last().rename(columns={"SALDO": "SALDO_REAL"})
 
 daily = pd.merge(d_pron, d_real, on="FECHA", how="outer").sort_values("FECHA")
 
-# Relleno diario continuo
 all_days = pd.date_range(start=daily["FECHA"].min(), end=daily["FECHA"].max(), freq="D")
 daily = daily.set_index("FECHA").reindex(all_days).rename_axis("FECHA").reset_index()
 daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(saldo_hoy)
 daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(saldo_hoy)
 
-# Líneas fijas
 if cuenta_suplidos is not None:
     daily["LINEA_SUPLIDOS"] = float(cuenta_suplidos)
 if cuenta_efectivo is not None:
     daily["LINEA_EFECTIVO"] = float(cuenta_efectivo)
 
-# Zoom: rango visible
 zoom_start = pd.Timestamp(d_from)
 zoom_end = pd.Timestamp(d_to)
 daily_zoom = daily[(daily["FECHA"] >= zoom_start) & (daily["FECHA"] <= zoom_end)].copy()
@@ -717,6 +725,7 @@ mov_pron_out = mov_pron[cols_pron].copy()
 
 styled_mov_pron = (
     mov_pron_out.style
+    .applymap(style_estado_cell, subset=["COBRADO/PAGADO"])
     .applymap(color_saldo, subset=["SALDO"])
     .format({"COBROS": eur, "PAGOS": eur, "SALDO": eur})
 )
@@ -736,6 +745,7 @@ mov_real_out = mov_real[cols_real].copy()
 
 styled_mov_real = (
     mov_real_out.style
+    .applymap(style_estado_cell, subset=["COBRADO/PAGADO"])
     .applymap(color_saldo, subset=["SALDO"])
     .format({"COBROS": eur, "PAGOS": eur, "SALDO": eur})
 )
