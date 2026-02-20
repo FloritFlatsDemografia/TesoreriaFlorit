@@ -60,7 +60,7 @@ def color_saldo(v):
     return ""
 
 # -----------------------------
-# NUEVO: leer hoja BANCOS
+# Leer hoja BANCOS
 # -----------------------------
 def read_bancos_from_excel(uploaded_file) -> dict:
     """
@@ -69,8 +69,7 @@ def read_bancos_from_excel(uploaded_file) -> dict:
       - cuenta_suplidos (opcional)
       - cuenta_efectivo (opcional)
 
-    Nota: usa openpyxl con data_only=True para leer el resultado de fórmulas
-    (debe estar guardado/calculado en Excel).
+    data_only=True lee el resultado guardado de fórmulas (TOTAL BANCOS).
     """
     uploaded_file.seek(0)
     wb = openpyxl.load_workbook(uploaded_file, data_only=True)
@@ -90,8 +89,7 @@ def read_bancos_from_excel(uploaded_file) -> dict:
         v = ws.cell(r, 2).value
         if k is None:
             continue
-        key = str(k).strip().upper()
-        mapping[key] = v
+        mapping[str(k).strip().upper()] = v
 
     def get_num(key: str):
         v = mapping.get(key)
@@ -116,7 +114,7 @@ def read_bancos_from_excel(uploaded_file) -> dict:
     }
 
 # -----------------------------
-# Lectura catálogo
+# Leer catálogo
 # -----------------------------
 def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     uploaded_file.seek(0)
@@ -136,6 +134,7 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     # PAGADO + FECHA (opcionales)
     if "PAGADO" not in df.columns:
         df["PAGADO"] = ""
+    # FECHA = fecha de pago real (si existe)
     if "FECHA" in df.columns:
         df["FECHA_PAGO"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.normalize()
     else:
@@ -400,7 +399,7 @@ saldo_hoy = float(bancos["total_bancos"])
 cuenta_suplidos = bancos.get("cuenta_suplidos", None)
 cuenta_efectivo = bancos.get("cuenta_efectivo", None)
 
-# Mostrar en sidebar como info (sin input manual)
+# Mostrar en sidebar como info
 st.sidebar.header("Bancos (desde Excel)")
 st.sidebar.metric("TOTAL BANCOS (saldo inicial)", eur(saldo_hoy))
 if cuenta_suplidos is not None:
@@ -430,9 +429,9 @@ if generated.empty:
     st.stop()
 
 # -----------------------------
-# Filtros base (afectan al cálculo real)
+# Filtros base
 # -----------------------------
-st.sidebar.header("Filtros base (afectan al saldo real)")
+st.sidebar.header("Filtros base")
 deptos = sorted(generated["DEPARTAMENTO"].dropna().unique().tolist())
 tipos = sorted(generated["TIPO"].dropna().unique().tolist())
 
@@ -446,23 +445,27 @@ base_filtered = generated[
 
 base_filtered = base_filtered.sort_values("FECHA").reset_index(drop=True)
 
-# PRON solo pendientes
-pron_df = base_filtered[~base_filtered["PAGADO_BOOL"]].copy().sort_values("FECHA").reset_index(drop=True)
+# -----------------------------
+# PRON vs REAL (TU REGLA CORRECTA)
+# -----------------------------
+# PRON = solo pendientes (no pagados), usando IMPORTE_PRON en la FECHA prevista
+pron_df = base_filtered[~base_filtered["PAGADO_BOOL"]].copy()
+pron_df = pron_df.sort_values("FECHA").reset_index(drop=True)
 
-# REAL solo pagados y con FECHA_PAGO
-real_df = base_filtered[base_filtered["PAGADO_BOOL"]].copy()
-real_df = real_df[real_df["FECHA_PAGO"].notna()].copy()
-real_df["FECHA"] = pd.to_datetime(real_df["FECHA_PAGO"]).dt.normalize()
+# REAL = importes reales conocidos (pagados o no), usando IMPORTE_REAL
+# Fecha real efectiva: si hay FECHA_PAGO, se usa; si no, se usa la FECHA prevista
+real_df = base_filtered.copy()
+real_df["FECHA_EFECTIVA_REAL"] = real_df["FECHA_PAGO"]
+real_df["FECHA_EFECTIVA_REAL"] = real_df["FECHA_EFECTIVA_REAL"].fillna(real_df["FECHA"])
+real_df["FECHA"] = pd.to_datetime(real_df["FECHA_EFECTIVA_REAL"]).dt.normalize()
 real_df = real_df.sort_values("FECHA").reset_index(drop=True)
 
+# Info: pagados sin fecha
 pagados_sin_fecha = base_filtered[base_filtered["PAGADO_BOOL"] & base_filtered["FECHA_PAGO"].isna()].copy()
 if not pagados_sin_fecha.empty:
-    st.warning("Hay movimientos marcados como PAGADO pero sin FECHA de pago. No entrarán en la línea REAL.")
-    st.dataframe(
-        pagados_sin_fecha[["CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_REAL", "IMPORTE_PRON", "FECHA"]],
-        use_container_width=True
-    )
+    st.info("Info: Hay movimientos marcados como PAGADO pero sin FECHA de pago. En REAL se quedarán en la FECHA prevista.")
 
+# Consolidación
 consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON")
 consolidado_real = compute_balance_from_amount(real_df, saldo_hoy, "IMPORTE_REAL")
 
@@ -526,10 +529,10 @@ with c2:
 with c3:
     st.metric("Saldo final (PRON, pendientes)", eur(consolidado_pron["SALDO"].iloc[-1] if not consolidado_pron.empty else saldo_hoy))
 with c4:
-    st.metric("Saldo final (REAL, pagados)", eur(consolidado_real["SALDO"].iloc[-1] if not consolidado_real.empty else saldo_hoy))
+    st.metric("Saldo final (REAL, importes reales)", eur(consolidado_real["SALDO"].iloc[-1] if not consolidado_real.empty else saldo_hoy))
 
 # -----------------------------
-# Gráfico diario doble (PRON vs REAL) + líneas fijas
+# Gráfico diario (PRON vs REAL) + líneas fijas
 # -----------------------------
 st.subheader("Evolución de saldo — diario (Pronosticado vs Real)")
 
@@ -551,7 +554,7 @@ daily = daily.set_index("FECHA").reindex(all_days).rename_axis("FECHA").reset_in
 daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(saldo_hoy)
 daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(saldo_hoy)
 
-# Líneas fijas (constantes)
+# Líneas fijas
 if cuenta_suplidos is not None:
     daily["LINEA_SUPLIDOS"] = float(cuenta_suplidos)
 if cuenta_efectivo is not None:
@@ -565,7 +568,7 @@ daily_zoom = daily[(daily["FECHA"] >= zoom_start) & (daily["FECHA"] <= zoom_end)
 value_vars = ["SALDO_PRON", "SALDO_REAL"]
 series_map = {
     "SALDO_PRON": "Pronosticado (pendiente)",
-    "SALDO_REAL": "Real (pagado)"
+    "SALDO_REAL": "Real (importe real)"
 }
 
 if "LINEA_SUPLIDOS" in daily_zoom.columns:
@@ -583,8 +586,7 @@ plot_df = daily_zoom.melt(
 )
 plot_df["SERIE"] = plot_df["SERIE"].map(series_map)
 
-# Colores fijos (Altair)
-domain = ["Pronosticado (pendiente)", "Real (pagado)", "Cuenta suplidos", "Cuenta efectivo"]
+domain = ["Pronosticado (pendiente)", "Real (importe real)", "Cuenta suplidos", "Cuenta efectivo"]
 range_ = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728"]  # azul, verde, naranja, rojo
 
 chart = (
@@ -605,7 +607,7 @@ chart = (
 st.altair_chart(chart, use_container_width=True)
 
 # -----------------------------
-# Movimientos (formato tesorería) — PRON (pendientes)
+# Movimientos (formato tesorería) — PRON
 # -----------------------------
 st.subheader("Movimientos (formato tesorería) — PRON (pendientes)")
 
