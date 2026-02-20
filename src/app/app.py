@@ -59,23 +59,6 @@ def color_saldo(v):
         return "color: red; font-weight: 700;"
     return ""
 
-def next_business_day(d: pd.Timestamp) -> pd.Timestamp:
-    if d.weekday() == 5:
-        return d + pd.Timedelta(days=2)
-    if d.weekday() == 6:
-        return d + pd.Timedelta(days=1)
-    return d
-
-def add_business_days(d: pd.Timestamp, n: int) -> pd.Timestamp:
-    cur = d
-    step = 1 if n >= 0 else -1
-    remaining = abs(n)
-    while remaining > 0:
-        cur = cur + pd.Timedelta(days=step)
-        if cur.weekday() < 5:
-            remaining -= 1
-    return cur
-
 # -----------------------------
 # Leer hoja BANCOS
 # -----------------------------
@@ -219,6 +202,23 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
 
     return df
 
+def next_business_day(d: pd.Timestamp) -> pd.Timestamp:
+    if d.weekday() == 5:
+        return d + pd.Timedelta(days=2)
+    if d.weekday() == 6:
+        return d + pd.Timedelta(days=1)
+    return d
+
+def add_business_days(d: pd.Timestamp, n: int) -> pd.Timestamp:
+    cur = d
+    step = 1 if n >= 0 else -1
+    remaining = abs(n)
+    while remaining > 0:
+        cur = cur + pd.Timedelta(days=step)
+        if cur.weekday() < 5:
+            remaining -= 1
+    return cur
+
 def months_step_from_periodicidad(periodicidad: str) -> int:
     p = (periodicidad or "").upper().strip()
     if p == "MENSUAL":
@@ -233,13 +233,43 @@ def months_step_from_periodicidad(periodicidad: str) -> int:
 
 def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
     """
-    - Soporta PRORRATEO=DIARIO en filas MENSUALES/BIMESTRALES/TRIMESTRALES/SEMESTRALES:
-      genera 1 evento por día del mes, repartiendo importes.
-    - Soporta PERIODICIDAD=DIARIA:
-      genera 1 evento por día (importe ya diario).
+    PRORRATEO=DIARIO:
+    - Si una fila es PUNTUAL/FECHA_FIJA y PRORRATEO=DIARIO -> reparte el importe mensual por días del mes de esa fecha.
+    - Si una fila es MENSUAL/BIMESTRAL/... y PRORRATEO=DIARIO -> reparte cada cuota mensual por días del mes correspondiente.
     """
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
     rows = []
+
+    def add_prorrateo_diario_for_month(anchor_date: pd.Timestamp, r: pd.Series):
+        anchor_date = pd.Timestamp(anchor_date).normalize()
+        y, m = anchor_date.year, anchor_date.month
+        month_start = pd.Timestamp(year=y, month=m, day=1).normalize()
+        month_end = (month_start + pd.offsets.MonthEnd(0)).normalize()
+        days_in_month = int((month_end - month_start).days) + 1
+        if days_in_month <= 0:
+            return
+
+        imp_pron_day = float(r.get("IMPORTE_PRON", 0.0)) / days_in_month
+        imp_real_day = float(r.get("IMPORTE_REAL", 0.0)) / days_in_month
+
+        hasta = r.get("HASTA", pd.NaT)
+        hasta = pd.Timestamp(hasta).normalize() if not pd.isna(hasta) else pd.NaT
+
+        d = month_start
+        while d <= month_end:
+            if d < start_date or d > end_date:
+                d += pd.Timedelta(days=1)
+                continue
+            if not pd.isna(hasta) and d > hasta:
+                d += pd.Timedelta(days=1)
+                continue
+
+            rr = r.copy()
+            rr["IMPORTE_PRON"] = imp_pron_day
+            rr["IMPORTE_REAL"] = imp_real_day
+            rows.append((d.normalize(), rr))
+
+            d += pd.Timedelta(days=1)
 
     for _, r in catalog.iterrows():
         periodicidad = str(r.get("PERIODICIDAD", "")).upper().strip()
@@ -275,69 +305,24 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 if within_limits_adjusted(d_adj):
                     rows.append((d_adj, r))
 
-        def add_prorrateo_diario_for_month(d_base: pd.Timestamp):
-            """
-            Genera eventos diarios en el mes de d_base (días naturales).
-            Reparte IMPORTE_PRON e IMPORTE_REAL entre los días del mes.
-            """
-            d_base = pd.Timestamp(d_base).normalize()
-            y, m = d_base.year, d_base.month
-            month_start = pd.Timestamp(year=y, month=m, day=1).normalize()
-            month_end = (month_start + pd.offsets.MonthEnd(0)).normalize()
-            days_in_month = int((month_end - month_start).days) + 1
-            if days_in_month <= 0:
-                return
-
-            imp_pron_day = float(r.get("IMPORTE_PRON", 0.0)) / days_in_month
-            imp_real_day = float(r.get("IMPORTE_REAL", 0.0)) / days_in_month
-
-            d = month_start
-            while d <= month_end:
-                if d < start_date or d > end_date:
-                    d += pd.Timedelta(days=1)
-                    continue
-                if not pd.isna(hasta) and d > hasta:
-                    d += pd.Timedelta(days=1)
-                    continue
-
-                rr = r.copy()
-                rr["IMPORTE_PRON"] = imp_pron_day
-                rr["IMPORTE_REAL"] = imp_real_day
-                rows.append((d.normalize(), rr))
-
-                d += pd.Timedelta(days=1)
-
         # -----------------------------
-        # NUEVO: DIARIA (importe ya diario)
+        # PUNTUAL (ONE-OFF)
         # -----------------------------
-        if periodicidad == "DIARIA":
-            # Ancla: FECHA_FIJA (si viene como fecha) o hoy start_date si no hay
-            anchor = r.get("FECHA_FIJA", pd.NaT)
-            if pd.isna(anchor):
-                anchor = start_date
-            anchor = pd.Timestamp(anchor).normalize()
-
-            stop = end_date
-            if not pd.isna(hasta):
-                stop = min(stop, hasta)
-
-            d = anchor
-            while d <= stop:
-                # aquí podemos aplicar ajustes por día si quieres;
-                # yo NO los aplico para no deformar el diario (días naturales).
-                if d >= start_date and d <= end_date:
-                    rows.append((d.normalize(), r))
-                d += pd.Timedelta(days=1)
-            continue
-
-        # PUNTUAL
         if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF"):
             if pd.isna(r.get("FECHA_FIJA")):
                 continue
-            add_if_valid(pd.Timestamp(r["FECHA_FIJA"]).normalize())
+            anchor = pd.Timestamp(r["FECHA_FIJA"]).normalize()
+
+            # ✅ PUNTUAL + PRORRATEO DIARIO => reparte el importe mensual en ese mes
+            if prorrateo == "DIARIO":
+                add_prorrateo_diario_for_month(anchor, r)
+            else:
+                add_if_valid(anchor)
             continue
 
+        # -----------------------------
         # ANUAL
+        # -----------------------------
         if periodicidad == "ANUAL":
             if pd.isna(r.get("FECHA_FIJA")):
                 continue
@@ -351,7 +336,9 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 year += 1
             continue
 
+        # -----------------------------
         # SEMANAL
+        # -----------------------------
         if periodicidad == "SEMANAL":
             anchor = r.get("FECHA_FIJA")
             if pd.isna(anchor):
@@ -371,7 +358,9 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 d = d + pd.Timedelta(days=7)
             continue
 
+        # -----------------------------
         # MENSUAL / BIMESTRAL / TRIMESTRAL / SEMESTRAL
+        # -----------------------------
         if periodicidad in ("MENSUAL", "BIMESTRAL", "BIMENSUAL", "TRIMESTRAL", "SEMESTRAL"):
             step = months_step_from_periodicidad(periodicidad)
 
@@ -406,8 +395,9 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
 
                 if d_base is not None:
                     if prorrateo == "DIARIO":
+                        # ✅ MENSUAL + PRORRATEO DIARIO => reparte la cuota del mes
                         if within_limits_base(d_base):
-                            add_prorrateo_diario_for_month(d_base)
+                            add_prorrateo_diario_for_month(d_base, r)
                     else:
                         add_if_valid(d_base)
 
@@ -484,31 +474,23 @@ except Exception as e:
     st.error(f"Error leyendo catálogo: {e}")
     st.stop()
 
-# Avisos de control (muy útiles)
-n_prorr_diario = int((catalog["PRORRATEO"] == "DIARIO").sum()) if "PRORRATEO" in catalog.columns else 0
-n_per_diaria = int((catalog["PERIODICIDAD"] == "DIARIA").sum()) if "PERIODICIDAD" in catalog.columns else 0
-
-if n_prorr_diario == 0:
-    st.warning("No detecto filas con PRORRATEO=DIARIO. Si esperas movimientos diarios por prorrateo mensual, añade esa columna y pon DIARIO.")
-else:
-    st.success(f"Detectadas {n_prorr_diario} filas con PRORRATEO=DIARIO (se generarán movimientos diarios por reparto).")
-
-if n_per_diaria > 0:
-    st.info(f"Detectadas {n_per_diaria} filas con PERIODICIDAD=DIARIA (se generará un movimiento cada día con importe diario).")
-
 start_ts = pd.Timestamp(saldo_fecha).normalize()
 generated = generate_events_from_catalog(catalog=catalog, start_date=start_ts, months_horizon=months_horizon)
+
+if generated.empty:
+    st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / VALOR_FECHA / HASTA).")
+    st.dataframe(catalog.head(50), use_container_width=True)
+    st.stop()
+
+# Aviso si no hay prorrateo diario
+if not (generated["PRORRATEO"].astype(str).str.upper().eq("DIARIO")).any():
+    st.warning("No detecto filas con PRORRATEO=DIARIO. Si quieres prorrateo diario, añade columna PRORRATEO y pon DIARIO.")
 
 if dedupe_exact and not generated.empty:
     generated = generated.drop_duplicates(
         subset=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_PRON", "IMPORTE_REAL", "PAGADO_BOOL", "FECHA_PAGO", "PRORRATEO"],
         keep="first"
     )
-
-if generated.empty:
-    st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / VALOR_FECHA / HASTA).")
-    st.dataframe(catalog.head(50), use_container_width=True)
-    st.stop()
 
 # -----------------------------
 # Filtros base
@@ -523,25 +505,24 @@ sel_tipos = st.sidebar.multiselect("Tipo", options=tipos, default=tipos)
 base_filtered = generated[
     generated["DEPARTAMENTO"].isin(sel_deptos) &
     generated["TIPO"].isin(sel_tipos)
-].copy()
-
-base_filtered = base_filtered.sort_values("FECHA").reset_index(drop=True)
+].copy().sort_values("FECHA").reset_index(drop=True)
 
 # -----------------------------
 # PRON vs REAL
 # -----------------------------
-pron_df = base_filtered[~base_filtered["PAGADO_BOOL"]].copy()
-pron_df = pron_df.sort_values("FECHA").reset_index(drop=True)
+# PRON = solo pendientes (no pagados), usando IMPORTE_PRON
+pron_df = base_filtered[~base_filtered["PAGADO_BOOL"]].copy().sort_values("FECHA").reset_index(drop=True)
 
+# REAL = importes reales conocidos (pagados o no), usando IMPORTE_REAL
+# Fecha real efectiva: si hay FECHA_PAGO, se usa; si no, FECHA prevista
 real_df = base_filtered.copy()
-real_df["FECHA_EFECTIVA_REAL"] = real_df["FECHA_PAGO"]
-real_df["FECHA_EFECTIVA_REAL"] = real_df["FECHA_EFECTIVA_REAL"].fillna(real_df["FECHA"])
+real_df["FECHA_EFECTIVA_REAL"] = real_df["FECHA_PAGO"].fillna(real_df["FECHA"])
 real_df["FECHA"] = pd.to_datetime(real_df["FECHA_EFECTIVA_REAL"]).dt.normalize()
 real_df = real_df.sort_values("FECHA").reset_index(drop=True)
 
 pagados_sin_fecha = base_filtered[base_filtered["PAGADO_BOOL"] & base_filtered["FECHA_PAGO"].isna()].copy()
 if not pagados_sin_fecha.empty:
-    st.info("Info: Hay movimientos marcados como PAGADO pero sin FECHA de pago. En REAL se quedarán en la FECHA prevista.")
+    st.info("Info: Hay movimientos marcados como PAGADO pero sin FECHA. En REAL se quedan en la FECHA prevista.")
 
 consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON")
 consolidado_real = compute_balance_from_amount(real_df, saldo_hoy, "IMPORTE_REAL")
@@ -567,7 +548,7 @@ consolidado_pron2 = pd.concat([base_row, consolidado_pron], ignore_index=True)
 consolidado_real2 = pd.concat([base_row, consolidado_real], ignore_index=True)
 
 # -----------------------------
-# Buscador + rango fechas (solo visualización)
+# Buscador + rango fechas
 # -----------------------------
 st.sidebar.header("Búsqueda y rango (solo visualización)")
 q = st.sidebar.text_input("Buscar concepto", value="").strip()
@@ -638,10 +619,7 @@ zoom_end = pd.Timestamp(d_to)
 daily_zoom = daily[(daily["FECHA"] >= zoom_start) & (daily["FECHA"] <= zoom_end)].copy()
 
 value_vars = ["SALDO_PRON", "SALDO_REAL"]
-series_map = {
-    "SALDO_PRON": "Pronosticado (pendiente)",
-    "SALDO_REAL": "Real (importe real)"
-}
+series_map = {"SALDO_PRON": "Pronosticado (pendiente)", "SALDO_REAL": "Real (importe real)"}
 
 if "LINEA_SUPLIDOS" in daily_zoom.columns:
     value_vars.append("LINEA_SUPLIDOS")
@@ -650,16 +628,8 @@ if "LINEA_EFECTIVO" in daily_zoom.columns:
     value_vars.append("LINEA_EFECTIVO")
     series_map["LINEA_EFECTIVO"] = "Cuenta efectivo"
 
-plot_df = daily_zoom.melt(
-    id_vars=["FECHA"],
-    value_vars=value_vars,
-    var_name="SERIE",
-    value_name="SALDO"
-)
+plot_df = daily_zoom.melt(id_vars=["FECHA"], value_vars=value_vars, var_name="SERIE", value_name="SALDO")
 plot_df["SERIE"] = plot_df["SERIE"].map(series_map)
-
-domain = ["Pronosticado (pendiente)", "Real (importe real)", "Cuenta suplidos", "Cuenta efectivo"]
-range_ = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728"]
 
 chart = (
     alt.Chart(plot_df)
@@ -667,7 +637,7 @@ chart = (
     .encode(
         x=alt.X("FECHA:T", title="Fecha"),
         y=alt.Y("SALDO:Q", title="Saldo"),
-        color=alt.Color("SERIE:N", title="", scale=alt.Scale(domain=domain, range=range_)),
+        color=alt.Color("SERIE:N", title=""),
         tooltip=[
             alt.Tooltip("FECHA:T", title="Fecha"),
             alt.Tooltip("SERIE:N", title="Serie"),
@@ -710,12 +680,9 @@ monthly_visible = tmp.groupby("MES", as_index=False).agg(
 
 glob = consolidado_pron2.copy()
 glob["MES"] = glob["FECHA"].dt.to_period("M").astype(str)
-monthly_global_close = glob.groupby("MES", as_index=False).agg(
-    SALDO_CIERRE=("SALDO", "last")
-)
+monthly_global_close = glob.groupby("MES", as_index=False).agg(SALDO_CIERRE=("SALDO", "last"))
 
 monthly = monthly_visible.merge(monthly_global_close, on="MES", how="left")
-
 styled_month = monthly.style.format({c: eur for c in monthly.columns if c != "MES"})
 st.dataframe(styled_month, use_container_width=True)
 
