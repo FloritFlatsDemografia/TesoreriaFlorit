@@ -131,6 +131,11 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Faltan columnas requeridas: {missing}. Columnas detectadas: {list(df.columns)}")
 
+    # PRORRATEO (opcional): para prorrateo DIARIO de importes mensuales
+    if "PRORRATEO" not in df.columns:
+        df["PRORRATEO"] = ""
+    df["PRORRATEO"] = df["PRORRATEO"].astype(str).str.strip().str.upper()
+
     # PAGADO + FECHA (opcionales)
     if "PAGADO" not in df.columns:
         df["PAGADO"] = ""
@@ -228,6 +233,16 @@ def months_step_from_periodicidad(periodicidad: str) -> int:
     return 1
 
 def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
+    """
+    Soporta PRORRATEO=DIARIO para filas MENSUALES/BIMESTRALES/...:
+    - Calcula la cuota base del mes (d_base) como siempre.
+    - Si PRORRATEO=DIARIO, en vez de 1 evento, genera 1 evento por día del mes (días naturales),
+      repartiendo IMPORTE_PRON e IMPORTE_REAL entre los días del mes.
+    - Los ajustes (SIG_HABIL / LAG) se aplican a la FECHA BASE (d_base) y a cada día generado,
+      pero ojo: para prorrateo diario normalmente NO se desea mover cada día por SIG_HABIL.
+      Por simplicidad y coherencia contable, el prorrateo diario usa DÍAS NATURALES sin moverlos.
+      (SIG_HABIL/LAG seguirá afectando a las filas NO prorrateadas.)
+    """
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
     rows = []
 
@@ -236,6 +251,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         regla = str(r.get("REGLA_FECHA", "")).upper().strip()
         ajuste = str(r.get("AJUSTE FINDE", "")).upper().strip()
         lag = int(r.get("LAG", 0))
+        prorrateo = str(r.get("PRORRATEO", "")).upper().strip()
 
         hasta = r.get("HASTA", pd.NaT)
         hasta = pd.Timestamp(hasta).normalize() if not pd.isna(hasta) else pd.NaT
@@ -263,6 +279,41 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 d_adj = apply_adjustments(d_base)
                 if within_limits_adjusted(d_adj):
                     rows.append((d_adj, r))
+
+        def add_prorrateo_diario_for_month(d_base: pd.Timestamp):
+            """
+            Genera eventos diarios en el mes de d_base (días naturales).
+            Reparte IMPORTE_PRON e IMPORTE_REAL entre los días del mes.
+            Respeta límites por horizonte y HASTA por día (base).
+            """
+            d_base = pd.Timestamp(d_base).normalize()
+            y, m = d_base.year, d_base.month
+            month_start = pd.Timestamp(year=y, month=m, day=1).normalize()
+            month_end = (month_start + pd.offsets.MonthEnd(0)).normalize()
+            days_in_month = int((month_end - month_start).days) + 1
+            if days_in_month <= 0:
+                return
+
+            # Reparto diario (float). No redondeamos aquí para mantener suma exacta en acumulados.
+            imp_pron_day = float(r.get("IMPORTE_PRON", 0.0)) / days_in_month
+            imp_real_day = float(r.get("IMPORTE_REAL", 0.0)) / days_in_month
+
+            d = month_start
+            while d <= month_end:
+                # HASTA valida sobre la fecha base (sin ajustes). Aquí base=el propio día.
+                if d < start_date or d > end_date:
+                    d += pd.Timedelta(days=1)
+                    continue
+                if not pd.isna(hasta) and d > hasta:
+                    d += pd.Timedelta(days=1)
+                    continue
+
+                rr = r.copy()
+                rr["IMPORTE_PRON"] = imp_pron_day
+                rr["IMPORTE_REAL"] = imp_real_day
+                rows.append((d.normalize(), rr))
+
+                d += pd.Timedelta(days=1)
 
         # PUNTUAL
         if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF"):
@@ -316,9 +367,9 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                 day = r.get("DIA_MES")
                 if not day or pd.isna(day):
                     continue
-                y, m = start_date.year, start_date.month
-                last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
-                base_date = pd.Timestamp(year=y, month=m, day=min(int(day), int(last_day))).normalize()
+                y0, m0 = start_date.year, start_date.month
+                last_day0 = (pd.Timestamp(year=y0, month=m0, day=1) + pd.offsets.MonthEnd(0)).day
+                base_date = pd.Timestamp(year=y0, month=m0, day=min(int(day), int(last_day0))).normalize()
                 anchor_day = base_date.day
 
             current = base_date
@@ -339,14 +390,19 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
                     d_base = None
 
                 if d_base is not None:
-                    add_if_valid(d_base)
+                    if prorrateo == "DIARIO":
+                        # Prorrateo diario (días naturales del mes)
+                        if within_limits_base(d_base):
+                            add_prorrateo_diario_for_month(d_base)
+                    else:
+                        add_if_valid(d_base)
 
                 current = (current + pd.DateOffset(months=step)).normalize()
 
     if not rows:
         return pd.DataFrame(columns=[
             "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_PRON", "IMPORTE_REAL", "NATURALEZA",
-            "PAGADO_BOOL", "FECHA_PAGO"
+            "PAGADO_BOOL", "FECHA_PAGO", "PRORRATEO"
         ])
 
     out = pd.DataFrame([{
@@ -354,11 +410,12 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         "CONCEPTO": rr["GENERAL"],
         "TIPO": rr["TIPO"],
         "DEPARTAMENTO": rr["DEPARTAMENTO"],
-        "IMPORTE_PRON": float(rr["IMPORTE_PRON"]),
-        "IMPORTE_REAL": float(rr["IMPORTE_REAL"]),
+        "IMPORTE_PRON": float(rr.get("IMPORTE_PRON", 0.0)),
+        "IMPORTE_REAL": float(rr.get("IMPORTE_REAL", 0.0)),
         "NATURALEZA": rr.get("NATURALEZA", ""),
         "PAGADO_BOOL": bool(rr.get("PAGADO_BOOL", False)),
         "FECHA_PAGO": rr.get("FECHA_PAGO", pd.NaT),
+        "PRORRATEO": str(rr.get("PRORRATEO", "")).upper().strip(),
     } for d, rr in rows])
 
     out["FECHA_PAGO"] = pd.to_datetime(out["FECHA_PAGO"], errors="coerce").dt.normalize()
@@ -419,7 +476,7 @@ generated = generate_events_from_catalog(catalog=catalog, start_date=start_ts, m
 
 if dedupe_exact and not generated.empty:
     generated = generated.drop_duplicates(
-        subset=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_PRON", "IMPORTE_REAL", "PAGADO_BOOL", "FECHA_PAGO"],
+        subset=["FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_PRON", "IMPORTE_REAL", "PAGADO_BOOL", "FECHA_PAGO", "PRORRATEO"],
         keep="first"
     )
 
@@ -480,6 +537,7 @@ base_row = pd.DataFrame([{
     "NATURALEZA": "SALDO",
     "PAGADO_BOOL": False,
     "FECHA_PAGO": pd.NaT,
+    "PRORRATEO": "",
     "COBROS": 0.0,
     "PAGOS": 0.0,
     "NETO": 0.0,
