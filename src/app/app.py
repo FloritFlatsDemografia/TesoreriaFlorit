@@ -5,6 +5,7 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 import altair as alt
+import openpyxl
 
 # -----------------------------
 # Config
@@ -41,12 +42,90 @@ def is_pagado(v) -> bool:
     s = str(v).strip().lower()
     return s in {"✓", "✅", "x", "si", "sí", "true", "1", "ok", "pagado", "y", "yes"}
 
+def eur(x):
+    try:
+        return f"{float(x):,.2f} €"
+    except Exception:
+        return ""
+
+def color_saldo(v):
+    try:
+        v = float(v)
+    except Exception:
+        return ""
+    if v > 0:
+        return "color: green; font-weight: 700;"
+    if v < 0:
+        return "color: red; font-weight: 700;"
+    return ""
+
+# -----------------------------
+# NUEVO: leer hoja BANCOS
+# -----------------------------
+def read_bancos_from_excel(uploaded_file) -> dict:
+    """
+    Lee hoja 'BANCOS' y devuelve:
+      - total_bancos
+      - cuenta_suplidos (opcional)
+      - cuenta_efectivo (opcional)
+
+    Nota: usa openpyxl con data_only=True para leer el resultado de fórmulas
+    (debe estar guardado/calculado en Excel).
+    """
+    uploaded_file.seek(0)
+    wb = openpyxl.load_workbook(uploaded_file, data_only=True)
+    sheet_name = None
+    for name in wb.sheetnames:
+        if str(name).strip().upper() == "BANCOS":
+            sheet_name = name
+            break
+    if sheet_name is None:
+        raise ValueError("No encuentro la hoja 'BANCOS' en el Excel.")
+
+    ws = wb[sheet_name]
+
+    mapping = {}
+    for r in range(1, ws.max_row + 1):
+        k = ws.cell(r, 1).value
+        v = ws.cell(r, 2).value
+        if k is None:
+            continue
+        key = str(k).strip().upper()
+        mapping[key] = v
+
+    def get_num(key: str):
+        v = mapping.get(key)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    total_bancos = get_num("TOTAL BANCOS")
+    suplidos = get_num("CUENTA SUPLIDOS")
+    efectivo = get_num("CUENTA DE EFECTIVO")
+
+    if total_bancos is None:
+        raise ValueError("En hoja BANCOS no puedo leer un número en 'TOTAL BANCOS' (columna €).")
+
+    return {
+        "total_bancos": total_bancos,
+        "cuenta_suplidos": suplidos,
+        "cuenta_efectivo": efectivo
+    }
+
+# -----------------------------
+# Lectura catálogo
+# -----------------------------
 def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
+    uploaded_file.seek(0)
     raw = pd.read_excel(uploaded_file, sheet_name=0, header=None, engine="openpyxl")
     header_idx = find_header_row(raw)
     if header_idx is None:
         raise ValueError("No encuentro la fila de cabecera (debe contener 'GENERAL' y 'TIPO').")
 
+    uploaded_file.seek(0)
     df = pd.read_excel(uploaded_file, sheet_name=0, header=header_idx, engine="openpyxl")
     df = normalize_cols(df)
 
@@ -54,15 +133,13 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Faltan columnas requeridas: {missing}. Columnas detectadas: {list(df.columns)}")
 
-    # -------- NUEVO: PAGADO + FECHA (opcionales) --------
+    # PAGADO + FECHA (opcionales)
     if "PAGADO" not in df.columns:
         df["PAGADO"] = ""
-    # OJO: tu Excel la llama "FECHA" (fecha de pago). Para no chocar con FECHA de eventos, la renombramos internamente.
     if "FECHA" in df.columns:
         df["FECHA_PAGO"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.normalize()
     else:
         df["FECHA_PAGO"] = pd.NaT
-
     df["PAGADO_BOOL"] = df["PAGADO"].apply(is_pagado)
 
     # Importes
@@ -152,11 +229,6 @@ def months_step_from_periodicidad(periodicidad: str) -> int:
     return 1
 
 def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
-    """
-    IMPORTANTÍSIMO:
-    - HASTA se interpreta como "última cuota PROGRAMADA" (fecha base, sin SIG_HABIL ni LAG).
-    - Una vez la cuota existe (d_base <= HASTA), se aplican ajustes y se incluye aunque d_adj > HASTA.
-    """
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
     rows = []
 
@@ -286,7 +358,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         "IMPORTE_PRON": float(rr["IMPORTE_PRON"]),
         "IMPORTE_REAL": float(rr["IMPORTE_REAL"]),
         "NATURALEZA": rr.get("NATURALEZA", ""),
-        # -------- NUEVO --------
         "PAGADO_BOOL": bool(rr.get("PAGADO_BOOL", False)),
         "FECHA_PAGO": rr.get("FECHA_PAGO", pd.NaT),
     } for d, rr in rows])
@@ -303,33 +374,11 @@ def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amoun
     return df
 
 # -----------------------------
-# Formatting helpers
-# -----------------------------
-def eur(x):
-    try:
-        return f"{float(x):,.2f} €"
-    except Exception:
-        return ""
-
-def color_saldo(v):
-    try:
-        v = float(v)
-    except Exception:
-        return ""
-    if v > 0:
-        return "color: green; font-weight: 700;"
-    if v < 0:
-        return "color: red; font-weight: 700;"
-    return ""
-
-# -----------------------------
 # Sidebar inputs
 # -----------------------------
 st.sidebar.header("Inputs")
 saldo_fecha = st.sidebar.date_input("Fecha del saldo (hoy)", value=date.today())
-saldo_hoy = st.sidebar.number_input("Saldo actual en banco (€)", min_value=-1e12, max_value=1e12, value=0.0, step=100.0)
 months_horizon = st.sidebar.slider("Horizonte forecast (meses)", min_value=1, max_value=36, value=12)
-
 dedupe_exact = st.sidebar.checkbox("Eliminar duplicados exactos (red de seguridad)", value=True)
 uploaded = st.sidebar.file_uploader("Sube el Excel de catálogo (xlsx)", type=["xlsx"])
 
@@ -340,6 +389,26 @@ if not uploaded:
     st.info("Sube tu Excel para generar el dashboard.")
     st.stop()
 
+# Leer BANCOS -> saldo inicial + líneas fijas
+try:
+    bancos = read_bancos_from_excel(uploaded)
+except Exception as e:
+    st.error(f"Error leyendo hoja BANCOS: {e}")
+    st.stop()
+
+saldo_hoy = float(bancos["total_bancos"])
+cuenta_suplidos = bancos.get("cuenta_suplidos", None)
+cuenta_efectivo = bancos.get("cuenta_efectivo", None)
+
+# Mostrar en sidebar como info (sin input manual)
+st.sidebar.header("Bancos (desde Excel)")
+st.sidebar.metric("TOTAL BANCOS (saldo inicial)", eur(saldo_hoy))
+if cuenta_suplidos is not None:
+    st.sidebar.metric("CUENTA SUPLIDOS", eur(cuenta_suplidos))
+if cuenta_efectivo is not None:
+    st.sidebar.metric("CUENTA DE EFECTIVO", eur(cuenta_efectivo))
+
+# Leer catálogo
 try:
     catalog = read_catalog_from_excel(uploaded)
 except Exception as e:
@@ -377,27 +446,25 @@ base_filtered = generated[
 
 base_filtered = base_filtered.sort_values("FECHA").reset_index(drop=True)
 
-# -------- NUEVO: PRON solo pendientes (no pagados) --------
-pron_df = base_filtered[~base_filtered["PAGADO_BOOL"]].copy()
-pron_df = pron_df.sort_values("FECHA").reset_index(drop=True)
+# PRON solo pendientes
+pron_df = base_filtered[~base_filtered["PAGADO_BOOL"]].copy().sort_values("FECHA").reset_index(drop=True)
 
-# -------- NUEVO: REAL solo pagados y con FECHA_PAGO --------
+# REAL solo pagados y con FECHA_PAGO
 real_df = base_filtered[base_filtered["PAGADO_BOOL"]].copy()
 real_df = real_df[real_df["FECHA_PAGO"].notna()].copy()
 real_df["FECHA"] = pd.to_datetime(real_df["FECHA_PAGO"]).dt.normalize()
 real_df = real_df.sort_values("FECHA").reset_index(drop=True)
 
-# Aviso: pagados sin fecha
 pagados_sin_fecha = base_filtered[base_filtered["PAGADO_BOOL"] & base_filtered["FECHA_PAGO"].isna()].copy()
 if not pagados_sin_fecha.empty:
     st.warning("Hay movimientos marcados como PAGADO pero sin FECHA de pago. No entrarán en la línea REAL.")
-    st.dataframe(pagados_sin_fecha[["CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_REAL", "IMPORTE_PRON", "FECHA"]].head(30),
-                 use_container_width=True)
+    st.dataframe(
+        pagados_sin_fecha[["CONCEPTO", "TIPO", "DEPARTAMENTO", "IMPORTE_REAL", "IMPORTE_PRON", "FECHA"]],
+        use_container_width=True
+    )
 
-# Pronosticado
-consolidado_pron = compute_balance_from_amount(pron_df, float(saldo_hoy), "IMPORTE_PRON")
-# Real
-consolidado_real = compute_balance_from_amount(real_df, float(saldo_hoy), "IMPORTE_REAL")
+consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON")
+consolidado_real = compute_balance_from_amount(real_df, saldo_hoy, "IMPORTE_REAL")
 
 # Fila saldo inicial
 base_row = pd.DataFrame([{
@@ -413,7 +480,7 @@ base_row = pd.DataFrame([{
     "COBROS": 0.0,
     "PAGOS": 0.0,
     "NETO": 0.0,
-    "SALDO": float(saldo_hoy)
+    "SALDO": saldo_hoy
 }])
 
 consolidado_pron2 = pd.concat([base_row, consolidado_pron], ignore_index=True)
@@ -453,16 +520,16 @@ view_df = view_df.sort_values("FECHA").reset_index(drop=True)
 # -----------------------------
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.metric("Saldo inicial (hoy)", eur(saldo_hoy))
+    st.metric("Saldo inicial (TOTAL BANCOS)", eur(saldo_hoy))
 with c2:
     st.metric("Neto periodo (PRON, pendientes)", eur(consolidado_pron["NETO"].sum() if not consolidado_pron.empty else 0.0))
 with c3:
-    st.metric("Saldo final (PRON, pendientes)", eur(consolidado_pron["SALDO"].iloc[-1] if not consolidado_pron.empty else float(saldo_hoy)))
+    st.metric("Saldo final (PRON, pendientes)", eur(consolidado_pron["SALDO"].iloc[-1] if not consolidado_pron.empty else saldo_hoy))
 with c4:
-    st.metric("Saldo final (REAL, pagados)", eur(consolidado_real["SALDO"].iloc[-1] if not consolidado_real.empty else float(saldo_hoy)))
+    st.metric("Saldo final (REAL, pagados)", eur(consolidado_real["SALDO"].iloc[-1] if not consolidado_real.empty else saldo_hoy))
 
 # -----------------------------
-# Gráfico diario doble (PRON vs REAL) con zoom al rango visible
+# Gráfico diario doble (PRON vs REAL) + líneas fijas
 # -----------------------------
 st.subheader("Evolución de saldo — diario (Pronosticado vs Real)")
 
@@ -481,21 +548,44 @@ daily = pd.merge(d_pron, d_real, on="FECHA", how="outer").sort_values("FECHA")
 # Relleno diario continuo
 all_days = pd.date_range(start=daily["FECHA"].min(), end=daily["FECHA"].max(), freq="D")
 daily = daily.set_index("FECHA").reindex(all_days).rename_axis("FECHA").reset_index()
-daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(float(saldo_hoy))
-daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(float(saldo_hoy))
+daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(saldo_hoy)
+daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(saldo_hoy)
+
+# Líneas fijas (constantes)
+if cuenta_suplidos is not None:
+    daily["LINEA_SUPLIDOS"] = float(cuenta_suplidos)
+if cuenta_efectivo is not None:
+    daily["LINEA_EFECTIVO"] = float(cuenta_efectivo)
 
 # Zoom: rango visible
 zoom_start = pd.Timestamp(d_from)
 zoom_end = pd.Timestamp(d_to)
 daily_zoom = daily[(daily["FECHA"] >= zoom_start) & (daily["FECHA"] <= zoom_end)].copy()
 
+value_vars = ["SALDO_PRON", "SALDO_REAL"]
+series_map = {
+    "SALDO_PRON": "Pronosticado (pendiente)",
+    "SALDO_REAL": "Real (pagado)"
+}
+
+if "LINEA_SUPLIDOS" in daily_zoom.columns:
+    value_vars.append("LINEA_SUPLIDOS")
+    series_map["LINEA_SUPLIDOS"] = "Cuenta suplidos"
+if "LINEA_EFECTIVO" in daily_zoom.columns:
+    value_vars.append("LINEA_EFECTIVO")
+    series_map["LINEA_EFECTIVO"] = "Cuenta efectivo"
+
 plot_df = daily_zoom.melt(
     id_vars=["FECHA"],
-    value_vars=["SALDO_PRON", "SALDO_REAL"],
+    value_vars=value_vars,
     var_name="SERIE",
     value_name="SALDO"
 )
-plot_df["SERIE"] = plot_df["SERIE"].map({"SALDO_PRON": "Pronosticado (pendiente)", "SALDO_REAL": "Real (pagado)"})
+plot_df["SERIE"] = plot_df["SERIE"].map(series_map)
+
+# Colores fijos (Altair)
+domain = ["Pronosticado (pendiente)", "Real (pagado)", "Cuenta suplidos", "Cuenta efectivo"]
+range_ = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728"]  # azul, verde, naranja, rojo
 
 chart = (
     alt.Chart(plot_df)
@@ -503,7 +593,7 @@ chart = (
     .encode(
         x=alt.X("FECHA:T", title="Fecha"),
         y=alt.Y("SALDO:Q", title="Saldo"),
-        color=alt.Color("SERIE:N", title=""),
+        color=alt.Color("SERIE:N", title="", scale=alt.Scale(domain=domain, range=range_)),
         tooltip=[
             alt.Tooltip("FECHA:T", title="Fecha"),
             alt.Tooltip("SERIE:N", title="Serie"),
@@ -531,7 +621,7 @@ styled_mov = (
 st.dataframe(styled_mov, use_container_width=True)
 
 # -----------------------------
-# Resumen mensual: COBROS/PAGOS/NETO según lo visible + SALDO_CIERRE GLOBAL
+# Resumen mensual
 # -----------------------------
 st.subheader("Resumen mensual (según lo visible)")
 
