@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from datetime import date
 from io import BytesIO
 
@@ -17,26 +18,108 @@ st.title("APP Tesorería — Dashboard")
 # Helpers
 # -----------------------------
 MIN_REQUIRED = [
-    "GENERAL", "TIPO", "DEPARTAMENTO",
-    "NATURALEZA", "PERIODICIDAD",
-    "REGLA_FECHA", "VALOR_FECHA",
-    "LAG", "AJUSTE FINDE"
+    "GENERAL",
+    "TIPO",
+    "DEPARTAMENTO",
+    "NATURALEZA",
+    "PERIODICIDAD",
+    "REGLA_FECHA",
+    "VALOR_FECHA",
+    "LAG",
+    "AJUSTE FINDE",
 ]
+
+OPTIONAL_NEW_COLUMNS = [
+    "RAIZ CUENTA CONTABLE",
+    "EMPRESA",
+    "FECHA CARGO GASTO",
+    "PERIODO_SERVICIO",
+    "IVA_EN_FACTURA",
+    "IVA_%",
+    "IVA_SENTIDO",
+    "TRATAMIENTO_IVA",
+]
+
+def strip_accents(text: str) -> str:
+    text = str(text)
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(c)
+    )
+
+def normalize_colname(name: str) -> str:
+    """
+    Normaliza nombres de columnas:
+    - quita acentos
+    - pasa a mayúsculas
+    - reemplaza saltos de línea
+    - colapsa espacios múltiples
+    """
+    s = strip_accents(str(name))
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = re.sub(r"\s+", " ", s).strip().upper()
+    return s
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [str(c).strip().upper() for c in df.columns]
+    df.columns = [normalize_colname(c) for c in df.columns]
+    return df
+
+def apply_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Renombra columnas detectadas a los nombres internos que usa la app.
+    """
+    df = df.copy()
+
+    alias_map = {
+        # Pronosticado
+        "PREVISION": "IMPORTE PRONOSTICADO",
+        "IMPORTE_PRONOSTICADO": "IMPORTE PRONOSTICADO",
+
+        # Real
+        "IMPORTE_REAL": "IMPORTE REAL",
+
+        # Fecha base del movimiento / cargo
+        "FECHA CARGO GASTO": "VALOR_FECHA",
+        "FECHA_CARGO_GASTO": "VALOR_FECHA",
+
+        # Ajustes / formato
+        "AJUSTE_FINDE": "AJUSTE FINDE",
+
+        # Variaciones por si aparecen con otros nombres
+        "REGLA FECHA": "REGLA_FECHA",
+        "VALOR FECHA": "VALOR_FECHA",
+
+        # IVA / nuevas columnas opcionales
+        "TRATAMINETO_IVA": "TRATAMIENTO_IVA",  # corrige typo si viene así
+        "TRATAMIENTO IVA": "TRATAMIENTO_IVA",
+        "RAIZ_CUENTA_CONTABLE": "RAIZ CUENTA CONTABLE",
+        "PERIODO SERVICIO": "PERIODO_SERVICIO",
+    }
+
+    rename_dict = {}
+    for col in df.columns:
+        if col in alias_map:
+            target = alias_map[col]
+            if target not in df.columns:
+                rename_dict[col] = target
+
+    if rename_dict:
+        df = df.rename(columns=rename_dict)
+
     return df
 
 def find_header_row(df_raw: pd.DataFrame) -> int | None:
     for i in range(min(80, len(df_raw))):
-        row = df_raw.iloc[i].astype(str).str.strip().str.upper().tolist()
+        row = df_raw.iloc[i].astype(str).map(normalize_colname).tolist()
         if "GENERAL" in row and "TIPO" in row:
             return i
     return None
 
 def is_pagado(v) -> bool:
-    """Acepta ✓ / ✅ / X / SI / TRUE / 1 / OK / PAGADO (case-insensitive)."""
+    """
+    Acepta ✓ / ✅ / X / SI / SÍ / TRUE / 1 / OK / PAGADO / Y / YES
+    """
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return False
     s = str(v).strip().lower()
@@ -70,11 +153,11 @@ def estado_cobro_pago(tipo: str, pagado_bool: bool) -> str:
 def style_estado(val: str):
     s = str(val).strip().lower()
     if s == "pendiente":
-        return "background-color: #FDE6C8; font-weight: 700;"  # naranja clarito
+        return "background-color: #FDE6C8; font-weight: 700;"
     if s == "cobrado":
-        return "background-color: #D8F3DC; color: #0B6E2E; font-weight: 700;"  # verde
+        return "background-color: #D8F3DC; color: #0B6E2E; font-weight: 700;"
     if s == "pagado":
-        return "background-color: #F8D7DA; color: #8A1C1C; font-weight: 700;"  # rojo
+        return "background-color: #F8D7DA; color: #8A1C1C; font-weight: 700;"
     return ""
 
 # -----------------------------
@@ -144,10 +227,21 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     uploaded_file.seek(0)
     df = pd.read_excel(uploaded_file, sheet_name=0, header=header_idx, engine="openpyxl")
     df = normalize_cols(df)
+    df = apply_column_aliases(df)
 
     missing = [c for c in MIN_REQUIRED if c not in df.columns]
     if missing:
-        raise ValueError(f"Faltan columnas requeridas: {missing}. Columnas detectadas: {list(df.columns)}")
+        raise ValueError(
+            f"Faltan columnas requeridas: {missing}. "
+            f"Columnas detectadas: {list(df.columns)}"
+        )
+
+    # -------------------------
+    # Columnas opcionales / nuevas
+    # -------------------------
+    for c in OPTIONAL_NEW_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
 
     # PRORRATEO (opcional)
     if "PRORRATEO" not in df.columns:
@@ -157,24 +251,22 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     # PAGADO + FECHA (opcionales)
     if "PAGADO" not in df.columns:
         df["PAGADO"] = ""
+
     if "FECHA" in df.columns:
         df["FECHA_PAGO"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.normalize()
     else:
         df["FECHA_PAGO"] = pd.NaT
+
     df["PAGADO_BOOL"] = df["PAGADO"].apply(is_pagado)
 
+    # -------------------------
     # Importes
+    # -------------------------
     if "IMPORTE PRONOSTICADO" not in df.columns:
-        if "IMPORTE_PRONOSTICADO" in df.columns:
-            df["IMPORTE PRONOSTICADO"] = df["IMPORTE_PRONOSTICADO"]
-        else:
-            raise ValueError("Falta columna: 'IMPORTE PRONOSTICADO'")
+        raise ValueError("Falta columna: 'IMPORTE PRONOSTICADO' o su alias 'PREVISION'")
 
     if "IMPORTE REAL" not in df.columns:
-        if "IMPORTE_REAL" in df.columns:
-            df["IMPORTE REAL"] = df["IMPORTE_REAL"]
-        else:
-            df["IMPORTE REAL"] = 0.0
+        df["IMPORTE REAL"] = 0.0
 
     # HASTA (opcional)
     if "HASTA" not in df.columns:
@@ -183,7 +275,15 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
 
     df = df.dropna(how="all").copy()
 
-    for c in ["GENERAL", "TIPO", "DEPARTAMENTO", "NATURALEZA", "PERIODICIDAD", "REGLA_FECHA", "AJUSTE FINDE"]:
+    for c in [
+        "GENERAL",
+        "TIPO",
+        "DEPARTAMENTO",
+        "NATURALEZA",
+        "PERIODICIDAD",
+        "REGLA_FECHA",
+        "AJUSTE FINDE"
+    ]:
         df[c] = df[c].astype(str).str.strip()
 
     df["TIPO"] = df["TIPO"].str.upper()
@@ -195,7 +295,6 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
 
     df["IMPORTE_PRON"] = pd.to_numeric(df["IMPORTE PRONOSTICADO"], errors="coerce").fillna(0.0)
     df["IMPORTE_REAL"] = pd.to_numeric(df["IMPORTE REAL"], errors="coerce").fillna(0.0)
-
     df["LAG"] = pd.to_numeric(df["LAG"], errors="coerce").fillna(0).astype(int)
 
     def to_day_of_month(v):
@@ -208,11 +307,21 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
                 return int(v.day)
             except Exception:
                 pass
+
         s = str(v).strip()
+
         if re.fullmatch(r"\d{1,2}", s):
             d = int(s)
             if 1 <= d <= 31:
                 return d
+
+        try:
+            dt = pd.to_datetime(s, errors="coerce")
+            if pd.notna(dt):
+                return int(dt.day)
+        except Exception:
+            pass
+
         return None
 
     df["DIA_MES"] = df["VALOR_FECHA"].apply(to_day_of_month)
@@ -225,6 +334,13 @@ def next_business_day(d: pd.Timestamp) -> pd.Timestamp:
         return d + pd.Timedelta(days=2)
     if d.weekday() == 6:
         return d + pd.Timedelta(days=1)
+    return d
+
+def previous_business_day(d: pd.Timestamp) -> pd.Timestamp:
+    if d.weekday() == 5:
+        return d - pd.Timedelta(days=1)
+    if d.weekday() == 6:
+        return d - pd.Timedelta(days=2)
     return d
 
 def add_business_days(d: pd.Timestamp, n: int) -> pd.Timestamp:
@@ -254,8 +370,8 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
     PRORRATEO=DIARIO:
       - Solo para periodicidades por mes (MENSUAL/BIMESTRAL/TRIMESTRAL/SEMESTRAL)
       - Genera 1 evento por día natural del mes
-      - Reparte IMPORTE_PRON e IMPORTE_REAL entre días del mes (sin redondear aquí)
-      - No aplica SIG_HABIL/LAG a cada día (se usa calendario natural)
+      - Reparte IMPORTE_PRON e IMPORTE_REAL entre días del mes
+      - No aplica SIG_HABIL/LAG a cada día
     """
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
     rows = []
@@ -273,6 +389,9 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         def apply_adjustments(d: pd.Timestamp) -> pd.Timestamp:
             if ajuste == "SIG_HABIL":
                 d = next_business_day(d)
+            elif ajuste in {"ANT_HABIL", "PREV_HABIL"}:
+                d = previous_business_day(d)
+
             if lag:
                 d = add_business_days(d, lag)
             return d
@@ -330,7 +449,10 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
             base = pd.Timestamp(r["FECHA_FIJA"]).normalize()
             year = start_date.year
             while True:
-                candidate = pd.Timestamp(year=year, month=base.month, day=base.day)
+                try:
+                    candidate = pd.Timestamp(year=year, month=base.month, day=base.day)
+                except Exception:
+                    break
                 if candidate > end_date:
                     break
                 add_one(candidate.normalize())
@@ -378,13 +500,14 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
             while current <= end_date:
                 y, m = current.year, current.month
 
-                if regla in ("DIA_MES", "DIA_MES ", "FECHA_FIJA"):
+                if regla in ("DIA_MES", "FECHA_FIJA"):
                     last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
                     d_base = pd.Timestamp(year=y, month=m, day=min(int(anchor_day), int(last_day))).normalize()
+
                 elif regla == "ULTIMO_HABIL":
                     d_base = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).normalize()
-                    if d_base.weekday() >= 5:
-                        d_base = next_business_day(d_base).normalize()
+                    d_base = previous_business_day(d_base).normalize()
+
                 else:
                     d_base = None
 
@@ -478,7 +601,7 @@ if dedupe_exact and not generated.empty:
     )
 
 if generated.empty:
-    st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / VALOR_FECHA / HASTA).")
+    st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / FECHA CARGO GASTO / HASTA).")
     st.dataframe(catalog.head(50), use_container_width=True)
     st.stop()
 
@@ -635,11 +758,8 @@ plot_df = daily_zoom.melt(
 )
 plot_df["SERIE"] = plot_df["SERIE"].map(series_map)
 
-# Colores pedidos:
-# Cuenta Efectivo en Naranja, Cuenta suplidos en Rojo,
-# Pronosticado en Azul claro y Real en azul oscuro
 domain = ["Pronosticado (pendiente)", "Real (estimado/ejecutado)", "Cuenta efectivo", "Cuenta suplidos"]
-range_ = ["#6BAED6", "#08519C", "#FF7F0E", "#D62728"]  # azul claro, azul oscuro, naranja, rojo
+range_ = ["#6BAED6", "#08519C", "#FF7F0E", "#D62728"]
 
 chart = (
     alt.Chart(plot_df)
@@ -681,8 +801,7 @@ styled_pron = (
 st.dataframe(styled_pron, use_container_width=True)
 
 # -----------------------------
-# Movimientos (formato tesorería) — REAL (estimado/ejecutado)
-# Incluye también los pagados/cobrados, para verlos y verificar contabilización.
+# Movimientos (formato tesorería) — REAL
 # -----------------------------
 st.subheader("Movimientos (formato tesorería) — REAL (estimado/ejecutado)")
 
@@ -704,7 +823,7 @@ styled_real = (
 st.dataframe(styled_real, use_container_width=True)
 
 # -----------------------------
-# Resumen mensual (REAL / PRON / AMBOS) — orden fijo: REAL, PRON, AMBOS
+# Resumen mensual
 # -----------------------------
 st.subheader("Resumen mensual")
 
@@ -748,7 +867,6 @@ else:
 
 # -----------------------------
 # Exportar a Excel (lo visible)
-# Exporta: Mov_PRON, Mov_REAL, Resumen_PRON, Resumen_REAL
 # -----------------------------
 st.subheader("Exportar (lo visible)")
 
@@ -756,7 +874,6 @@ export_mov_pron = mov_pron_out.copy()
 export_mov_real = mov_real_out.copy()
 
 for df_exp in (export_mov_pron, export_mov_real):
-    # COBROS/PAGOS/SALDO pueden estar ya numéricos; aseguramos coerción
     for c in ["COBROS", "PAGOS", "SALDO"]:
         df_exp[c] = pd.to_numeric(df_exp[c], errors="coerce")
 
