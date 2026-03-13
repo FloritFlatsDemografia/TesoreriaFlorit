@@ -813,27 +813,16 @@ def apply_visual_filters(df: pd.DataFrame) -> pd.DataFrame:
 view_pron = apply_visual_filters(consolidado_pron2)
 view_real = apply_visual_filters(consolidado_real2)
 
-# -----------------------------
-# KPIs
-# -----------------------------
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("Saldo inicial (TOTAL BANCOS)", eur(saldo_hoy))
 with c2:
     st.metric("Neto periodo (PRON, pendientes)", eur(consolidado_pron["NETO"].sum() if not consolidado_pron.empty else 0.0))
 with c3:
-    saldo_pron_final = consolidado_pron["SALDO"].iloc[-1] if not consolidado_pron.empty else saldo_hoy
-    st.metric("Saldo final (PRON, pendientes)", eur(saldo_pron_final))
+    st.metric("Saldo final (PRON, pendientes)", eur(consolidado_pron["SALDO"].iloc[-1] if not consolidado_pron.empty else saldo_hoy))
 with c4:
-    saldo_real_final = consolidado_real["SALDO"].iloc[-1] if not consolidado_real.empty else saldo_hoy
-    st.metric("Saldo final (REAL, estimado/ejecutado)", eur(saldo_real_final))
-with c5:
-    desviacion_total = saldo_real_final - saldo_pron_final
-    st.metric("Desviación PRON vs REAL", eur(desviacion_total))
+    st.metric("Saldo final (REAL, estimado/ejecutado)", eur(consolidado_real["SALDO"].iloc[-1] if not consolidado_real.empty else saldo_hoy))
 
-# -----------------------------
-# Gráfico diario
-# -----------------------------
 st.subheader("Evolución de saldo — diario (Pronosticado vs Real)")
 
 d_pron = consolidado_pron2[["FECHA", "SALDO"]].copy()
@@ -851,9 +840,6 @@ daily = daily.set_index("FECHA").reindex(all_days).rename_axis("FECHA").reset_in
 daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(saldo_hoy)
 daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(saldo_hoy)
 
-daily["DESVIACION"] = daily["SALDO_REAL"] - daily["SALDO_PRON"]
-daily["DESV_COLOR"] = daily["DESVIACION"].apply(lambda x: "Desviación positiva" if x >= 0 else "Desviación negativa")
-
 if cuenta_suplidos is not None:
     daily["LINEA_SUPLIDOS"] = float(cuenta_suplidos)
 if cuenta_efectivo is not None:
@@ -863,7 +849,6 @@ zoom_start = pd.Timestamp(d_from)
 zoom_end = pd.Timestamp(d_to)
 daily_zoom = daily[(daily["FECHA"] >= zoom_start) & (daily["FECHA"] <= zoom_end)].copy()
 
-# Líneas principales
 value_vars = ["SALDO_PRON", "SALDO_REAL"]
 series_map = {
     "SALDO_PRON": "Pronosticado (pendiente)",
@@ -885,20 +870,10 @@ plot_df = daily_zoom.melt(
 )
 plot_df["SERIE"] = plot_df["SERIE"].map(series_map)
 
-domain = [
-    "Pronosticado (pendiente)",
-    "Real (estimado/ejecutado)",
-    "Cuenta efectivo",
-    "Cuenta suplidos"
-]
-range_ = [
-    "#6BAED6",  # PRON
-    "#08519C",  # REAL
-    "#FF7F0E",  # EFECTIVO
-    "#8A2BE2",  # SUPLIDOS violeta
-]
+domain = ["Pronosticado (pendiente)", "Real (estimado/ejecutado)", "Cuenta efectivo", "Cuenta suplidos"]
+range_ = ["#6BAED6", "#08519C", "#FF7F0E", "#D62728"]
 
-base_chart = (
+chart = (
     alt.Chart(plot_df)
     .mark_line()
     .encode(
@@ -911,37 +886,10 @@ base_chart = (
             alt.Tooltip("SALDO:Q", title="Saldo", format=",.2f"),
         ],
     )
+    .properties(height=340)
 )
-
-# Línea de desviación con color dinámico
-desv_chart = (
-    alt.Chart(daily_zoom)
-    .mark_line(strokeWidth=3)
-    .encode(
-        x=alt.X("FECHA:T", title="Fecha"),
-        y=alt.Y("DESVIACION:Q", title="Saldo"),
-        color=alt.Color(
-            "DESV_COLOR:N",
-            title="",
-            scale=alt.Scale(
-                domain=["Desviación positiva", "Desviación negativa"],
-                range=["#1A9850", "#D73027"]
-            )
-        ),
-        tooltip=[
-            alt.Tooltip("FECHA:T", title="Fecha"),
-            alt.Tooltip("DESVIACION:Q", title="Desviación", format=",.2f"),
-            alt.Tooltip("DESV_COLOR:N", title="Tipo"),
-        ],
-    )
-)
-
-chart = (base_chart + desv_chart).properties(height=340)
 st.altair_chart(chart, use_container_width=True)
 
-# -----------------------------
-# Movimientos — PRON
-# -----------------------------
 st.subheader("Movimientos (formato tesorería) — PRON (pendientes)")
 
 mov_pron = view_pron.copy()
@@ -963,9 +911,6 @@ styled_pron = (
 )
 st.dataframe(styled_pron, use_container_width=True)
 
-# -----------------------------
-# Movimientos — REAL
-# -----------------------------
 st.subheader("Movimientos (formato tesorería) — REAL (estimado/ejecutado)")
 
 mov_real = view_real.copy()
@@ -987,9 +932,6 @@ styled_real = (
 )
 st.dataframe(styled_real, use_container_width=True)
 
-# -----------------------------
-# Resumen mensual
-# -----------------------------
 st.subheader("Resumen mensual")
 
 modo_resumen = st.radio(
@@ -1030,9 +972,6 @@ else:
     show_monthly_table(monthly_real, "Resumen mensual — REAL (estimado/ejecutado)")
     show_monthly_table(monthly_pron, "Resumen mensual — PRON (pendientes)")
 
-# -----------------------------
-# Exportar a Excel
-# -----------------------------
 st.subheader("Exportar (lo visible)")
 
 export_mov_pron = mov_pron_out.copy()
