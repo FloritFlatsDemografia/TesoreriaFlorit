@@ -2,6 +2,7 @@ import re
 import unicodedata
 from datetime import date
 from io import BytesIO
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -334,7 +335,7 @@ def months_step_from_periodicidad(periodicidad: str) -> int:
 # -----------------------------
 # Cálculo de fecha base
 # -----------------------------
-def resolve_base_date_for_row(r: pd.Series, reference_start: pd.Timestamp) -> pd.Timestamp | pd.NaT:
+def resolve_base_date_for_row(r: pd.Series, reference_start: pd.Timestamp) -> Optional[pd.Timestamp]:
     periodicidad = str(r.get("PERIODICIDAD", "")).upper().strip()
     regla = str(r.get("REGLA_FECHA", "")).upper().strip()
 
