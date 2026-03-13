@@ -331,6 +331,54 @@ def months_step_from_periodicidad(periodicidad: str) -> int:
         return 6
     return 1
 
+# -----------------------------
+# Cálculo de fecha base
+# -----------------------------
+def resolve_base_date_for_row(r: pd.Series, reference_start: pd.Timestamp) -> pd.Timestamp | pd.NaT:
+    periodicidad = str(r.get("PERIODICIDAD", "")).upper().strip()
+    regla = str(r.get("REGLA_FECHA", "")).upper().strip()
+
+    if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF", "ANUAL", "SEMANAL"):
+        if pd.notna(r.get("FECHA_FIJA")):
+            return pd.Timestamp(r["FECHA_FIJA"]).normalize()
+        return pd.NaT
+
+    if periodicidad in ("MENSUAL", "BIMESTRAL", "BIMENSUAL", "TRIMESTRAL", "SEMESTRAL"):
+        if pd.notna(r.get("FECHA_FIJA")):
+            return pd.Timestamp(r["FECHA_FIJA"]).normalize()
+
+        day = r.get("DIA_MES")
+        if day and not pd.isna(day):
+            y0, m0 = reference_start.year, reference_start.month
+            last_day0 = (pd.Timestamp(year=y0, month=m0, day=1) + pd.offsets.MonthEnd(0)).day
+            return pd.Timestamp(year=y0, month=m0, day=min(int(day), int(last_day0))).normalize()
+
+        if regla == "ULTIMO_HABIL":
+            y0, m0 = reference_start.year, reference_start.month
+            d = (pd.Timestamp(year=y0, month=m0, day=1) + pd.offsets.MonthEnd(0)).normalize()
+            return previous_business_day(d).normalize()
+
+    return pd.NaT
+
+def apply_row_adjustments(d: pd.Timestamp, ajuste: str, lag: int) -> pd.Timestamp:
+    if pd.isna(d):
+        return d
+
+    d = pd.Timestamp(d).normalize()
+
+    if ajuste == "SIG_HABIL":
+        d = next_business_day(d)
+    elif ajuste in {"ANT_HABIL", "PREV_HABIL"}:
+        d = previous_business_day(d)
+
+    if lag:
+        d = add_business_days(d, lag)
+
+    return d.normalize()
+
+# -----------------------------
+# Generador PRON (expande recurrencia)
+# -----------------------------
 def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
     rows = []
@@ -346,14 +394,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         hasta = pd.Timestamp(hasta).normalize() if not pd.isna(hasta) else pd.NaT
 
         def apply_adjustments(d: pd.Timestamp) -> pd.Timestamp:
-            if ajuste == "SIG_HABIL":
-                d = next_business_day(d)
-            elif ajuste in {"ANT_HABIL", "PREV_HABIL"}:
-                d = previous_business_day(d)
-
-            if lag:
-                d = add_business_days(d, lag)
-            return d
+            return apply_row_adjustments(d, ajuste, lag)
 
         def within_limits(d: pd.Timestamp) -> bool:
             if d < start_date or d > end_date:
@@ -478,7 +519,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
     if not rows:
         return pd.DataFrame(columns=[
             "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "CLIENTE", "IMPORTE_PRON", "IMPORTE_REAL",
-            "NATURALEZA", "PAGADO_BOOL", "FECHA_PAGO", "PRORRATEO"
+            "NATURALEZA", "PAGADO_BOOL", "FECHA_PAGO", "PRORRATEO", "ESTATUS"
         ])
 
     out = pd.DataFrame([{
@@ -501,6 +542,68 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         axis=1
     )
     return out.sort_values("FECHA").reset_index(drop=True)
+
+# -----------------------------
+# Generador REAL (NO expande recurrencia)
+# -----------------------------
+def build_real_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
+    end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
+    rows = []
+
+    for _, r in catalog.iterrows():
+        pagado_bool = bool(r.get("PAGADO_BOOL", False))
+        importe_real = float(r.get("IMPORTE_REAL", 0.0))
+        fecha_pago = r.get("FECHA_PAGO", pd.NaT)
+
+        tiene_senal_real = pagado_bool or (abs(importe_real) > 0) or pd.notna(fecha_pago)
+        if not tiene_senal_real:
+            continue
+
+        fecha_base = resolve_base_date_for_row(r, start_date)
+        ajuste = str(r.get("AJUSTE FINDE", "")).upper().strip()
+        lag = int(r.get("LAG", 0))
+
+        if pd.notna(fecha_pago):
+            fecha_real = pd.Timestamp(fecha_pago).normalize()
+        elif pd.notna(fecha_base):
+            fecha_real = apply_row_adjustments(fecha_base, ajuste, lag)
+        else:
+            continue
+
+        hasta = r.get("HASTA", pd.NaT)
+        hasta = pd.Timestamp(hasta).normalize() if not pd.isna(hasta) else pd.NaT
+
+        if fecha_real < start_date or fecha_real > end_date:
+            continue
+        if not pd.isna(hasta) and fecha_real > hasta:
+            continue
+
+        rows.append({
+            "FECHA": fecha_real,
+            "CONCEPTO": r.get("GENERAL", ""),
+            "TIPO": r.get("TIPO", ""),
+            "DEPARTAMENTO": r.get("DEPARTAMENTO", ""),
+            "CLIENTE": r.get("CLIENTE", ""),
+            "IMPORTE_PRON": float(r.get("IMPORTE_PRON", 0.0)),
+            "IMPORTE_REAL": importe_real,
+            "NATURALEZA": r.get("NATURALEZA", ""),
+            "PAGADO_BOOL": pagado_bool,
+            "FECHA_PAGO": pd.Timestamp(fecha_pago).normalize() if pd.notna(fecha_pago) else pd.NaT,
+            "PRORRATEO": str(r.get("PRORRATEO", "")).upper().strip(),
+            "ESTATUS": estado_cobro_pago(r.get("TIPO", ""), pagado_bool),
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "CLIENTE", "IMPORTE_PRON", "IMPORTE_REAL",
+            "NATURALEZA", "PAGADO_BOOL", "FECHA_PAGO", "PRORRATEO", "ESTATUS"
+        ])
+
+    out = pd.DataFrame(rows)
+    out["FECHA"] = pd.to_datetime(out["FECHA"], errors="coerce").dt.normalize()
+    out["FECHA_PAGO"] = pd.to_datetime(out["FECHA_PAGO"], errors="coerce").dt.normalize()
+    out = out.sort_values(["FECHA", "CONCEPTO", "CLIENTE"]).reset_index(drop=True)
+    return out
 
 def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amount_col: str) -> pd.DataFrame:
     df = df.copy()
@@ -552,10 +655,23 @@ except Exception as e:
     st.stop()
 
 start_ts = pd.Timestamp(saldo_fecha).normalize()
-generated = generate_events_from_catalog(catalog=catalog, start_date=start_ts, months_horizon=months_horizon)
 
-if dedupe_exact and not generated.empty:
-    generated = generated.drop_duplicates(
+# PRON = recurrencia expandida
+generated_pron = generate_events_from_catalog(
+    catalog=catalog,
+    start_date=start_ts,
+    months_horizon=months_horizon
+)
+
+# REAL = una fila real por línea del Excel, sin expandir recurrencia
+generated_real = build_real_events_from_catalog(
+    catalog=catalog,
+    start_date=start_ts,
+    months_horizon=months_horizon
+)
+
+if dedupe_exact and not generated_pron.empty:
+    generated_pron = generated_pron.drop_duplicates(
         subset=[
             "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "CLIENTE",
             "IMPORTE_PRON", "IMPORTE_REAL", "PAGADO_BOOL", "FECHA_PAGO", "PRORRATEO"
@@ -563,8 +679,17 @@ if dedupe_exact and not generated.empty:
         keep="first"
     )
 
-if generated.empty:
-    st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / FECHA CARGO GASTO / HASTA).")
+if dedupe_exact and not generated_real.empty:
+    generated_real = generated_real.drop_duplicates(
+        subset=[
+            "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "CLIENTE",
+            "IMPORTE_REAL", "PAGADO_BOOL", "FECHA_PAGO"
+        ],
+        keep="first"
+    )
+
+if generated_pron.empty and generated_real.empty:
+    st.warning("No se generaron movimientos (revisa PERIODICIDAD / REGLA_FECHA / FECHA CARGO GASTO / HASTA / FECHA / IMPORTE REAL / PAGADO).")
     st.dataframe(catalog.head(50), use_container_width=True)
     st.stop()
 
@@ -572,46 +697,65 @@ if generated.empty:
 # Filtros base
 # -----------------------------
 st.sidebar.header("Filtros base")
-deptos = sorted(generated["DEPARTAMENTO"].dropna().astype(str).unique().tolist())
-tipos = sorted(generated["TIPO"].dropna().astype(str).unique().tolist())
 
-sel_deptos = st.sidebar.multiselect("Departamento", options=deptos, default=deptos)
-sel_tipos = st.sidebar.multiselect("Tipo", options=tipos, default=tipos)
+all_deptos = sorted(
+    pd.concat([
+        generated_pron["DEPARTAMENTO"] if not generated_pron.empty else pd.Series(dtype=str),
+        generated_real["DEPARTAMENTO"] if not generated_real.empty else pd.Series(dtype=str),
+    ], ignore_index=True).dropna().astype(str).unique().tolist()
+)
 
-base_filtered = generated[
-    generated["DEPARTAMENTO"].isin(sel_deptos) &
-    generated["TIPO"].isin(sel_tipos)
-].copy().sort_values("FECHA").reset_index(drop=True)
+all_tipos = sorted(
+    pd.concat([
+        generated_pron["TIPO"] if not generated_pron.empty else pd.Series(dtype=str),
+        generated_real["TIPO"] if not generated_real.empty else pd.Series(dtype=str),
+    ], ignore_index=True).dropna().astype(str).unique().tolist()
+)
+
+sel_deptos = st.sidebar.multiselect("Departamento", options=all_deptos, default=all_deptos)
+sel_tipos = st.sidebar.multiselect("Tipo", options=all_tipos, default=all_tipos)
+
+base_filtered_pron = generated_pron[
+    generated_pron["DEPARTAMENTO"].isin(sel_deptos) &
+    generated_pron["TIPO"].isin(sel_tipos)
+].copy().sort_values("FECHA").reset_index(drop=True) if not generated_pron.empty else generated_pron.copy()
+
+base_filtered_real = generated_real[
+    generated_real["DEPARTAMENTO"].isin(sel_deptos) &
+    generated_real["TIPO"].isin(sel_tipos)
+].copy().sort_values("FECHA").reset_index(drop=True) if not generated_real.empty else generated_real.copy()
 
 # -----------------------------
 # PRON vs REAL
 # -----------------------------
-pron_df = base_filtered[~base_filtered["PAGADO_BOOL"]].copy().sort_values("FECHA").reset_index(drop=True)
+pron_df = base_filtered_pron[~base_filtered_pron["PAGADO_BOOL"]].copy().sort_values("FECHA").reset_index(drop=True)
 
-real_df = base_filtered.copy()
-real_df["FECHA_EFECTIVA_REAL"] = real_df["FECHA_PAGO"].fillna(real_df["FECHA"])
-real_df["FECHA"] = pd.to_datetime(real_df["FECHA_EFECTIVA_REAL"]).dt.normalize()
+real_df = base_filtered_real.copy()
+real_df["FECHA"] = pd.to_datetime(real_df["FECHA"], errors="coerce").dt.normalize()
 real_df["ESTATUS"] = real_df.apply(
     lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
     axis=1
 )
 real_df = real_df.sort_values("FECHA").reset_index(drop=True)
 
-pagados_sin_fecha = base_filtered[base_filtered["PAGADO_BOOL"] & base_filtered["FECHA_PAGO"].isna()].copy()
+pagados_sin_fecha = catalog[catalog["PAGADO_BOOL"] & catalog["FECHA_PAGO"].isna()].copy()
 if not pagados_sin_fecha.empty:
-    st.info("Info: Hay movimientos marcados como PAGADO pero sin FECHA de pago. En REAL se quedan en la FECHA prevista.")
+    st.info("Info: Hay movimientos marcados como PAGADO pero sin FECHA de pago. En REAL se colocan con la fecha calculada desde VALOR_FECHA.")
 
-consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON")
-consolidado_real = compute_balance_from_amount(real_df, saldo_hoy, "IMPORTE_REAL")
+consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON") if not pron_df.empty else pron_df.copy()
+consolidado_real = compute_balance_from_amount(real_df, saldo_hoy, "IMPORTE_REAL") if not real_df.empty else real_df.copy()
 
-consolidado_pron["ESTATUS"] = consolidado_pron.apply(
-    lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
-    axis=1
-)
-consolidado_real["ESTATUS"] = consolidado_real.apply(
-    lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
-    axis=1
-)
+if not consolidado_pron.empty:
+    consolidado_pron["ESTATUS"] = consolidado_pron.apply(
+        lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
+        axis=1
+    )
+
+if not consolidado_real.empty:
+    consolidado_real["ESTATUS"] = consolidado_real.apply(
+        lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
+        axis=1
+    )
 
 # Fila saldo inicial
 base_row = pd.DataFrame([{
@@ -633,8 +777,8 @@ base_row = pd.DataFrame([{
     "SALDO": saldo_hoy
 }])
 
-consolidado_pron2 = pd.concat([base_row, consolidado_pron], ignore_index=True)
-consolidado_real2 = pd.concat([base_row, consolidado_real], ignore_index=True)
+consolidado_pron2 = pd.concat([base_row, consolidado_pron], ignore_index=True) if not consolidado_pron.empty else base_row.copy()
+consolidado_real2 = pd.concat([base_row, consolidado_real], ignore_index=True) if not consolidado_real.empty else base_row.copy()
 
 # -----------------------------
 # Búsqueda + rango fechas
