@@ -42,6 +42,7 @@ OPTIONAL_NEW_COLUMNS = [
     "TRATAMIENTO_IVA",
 ]
 
+
 def strip_accents(text: str) -> str:
     text = str(text)
     return "".join(
@@ -49,16 +50,19 @@ def strip_accents(text: str) -> str:
         if not unicodedata.combining(c)
     )
 
+
 def normalize_colname(name: str) -> str:
     s = strip_accents(str(name))
     s = s.replace("\n", " ").replace("\r", " ")
     s = re.sub(r"\s+", " ", s).strip().upper()
     return s
 
+
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [normalize_colname(c) for c in df.columns]
     return df
+
 
 def apply_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -90,6 +94,7 @@ def apply_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 def find_header_row(df_raw: pd.DataFrame) -> int | None:
     for i in range(min(80, len(df_raw))):
         row = df_raw.iloc[i].astype(str).map(normalize_colname).tolist()
@@ -97,17 +102,27 @@ def find_header_row(df_raw: pd.DataFrame) -> int | None:
             return i
     return None
 
+
 def is_pagado(v) -> bool:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return False
     s = str(v).strip().lower()
     return s in {"✓", "✅", "x", "si", "sí", "true", "1", "ok", "pagado", "y", "yes"}
 
+
 def eur(x):
     try:
         return f"{float(x):,.2f} €"
     except Exception:
         return ""
+
+
+def pct(x):
+    try:
+        return f"{float(x):,.2f} %"
+    except Exception:
+        return ""
+
 
 def color_saldo(v):
     try:
@@ -120,6 +135,7 @@ def color_saldo(v):
         return "color: red; font-weight: 700;"
     return ""
 
+
 def estado_cobro_pago(tipo: str, pagado_bool: bool) -> str:
     t = (tipo or "").upper().strip()
     if t == "INGRESO":
@@ -127,6 +143,7 @@ def estado_cobro_pago(tipo: str, pagado_bool: bool) -> str:
     if t == "GASTO":
         return "PAGADO" if pagado_bool else "PENDIENTE"
     return ""
+
 
 def style_estado(val: str):
     s = str(val).strip().lower()
@@ -138,6 +155,7 @@ def style_estado(val: str):
         return "background-color: #F8D7DA; color: #8A1C1C; font-weight: 700;"
     return ""
 
+
 def concept_has_explicit_month(concepto: str) -> bool:
     s = strip_accents(str(concepto)).upper()
     meses = [
@@ -146,6 +164,21 @@ def concept_has_explicit_month(concepto: str) -> bool:
         "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"
     ]
     return any(m in s for m in meses)
+
+
+def safe_deviation_pct(real_value: float, pron_value: float) -> float:
+    """
+    Desviación % tomando PRON como base, pero usando el valor absoluto
+    del denominador para que el signo sea intuitivo incluso con saldos negativos.
+    """
+    try:
+        denom = abs(float(pron_value))
+        if denom == 0:
+            return 0.0
+        return ((float(real_value) - float(pron_value)) / denom) * 100.0
+    except Exception:
+        return 0.0
+
 
 # -----------------------------
 # Leer hoja BANCOS
@@ -192,6 +225,7 @@ def read_bancos_from_excel(uploaded_file) -> dict:
         "cuenta_suplidos": suplidos,
         "cuenta_efectivo": efectivo
     }
+
 
 # -----------------------------
 # Leer catálogo
@@ -302,6 +336,7 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
 
     return df
 
+
 def next_business_day(d: pd.Timestamp) -> pd.Timestamp:
     if d.weekday() == 5:
         return d + pd.Timedelta(days=2)
@@ -309,12 +344,14 @@ def next_business_day(d: pd.Timestamp) -> pd.Timestamp:
         return d + pd.Timedelta(days=1)
     return d
 
+
 def previous_business_day(d: pd.Timestamp) -> pd.Timestamp:
     if d.weekday() == 5:
         return d - pd.Timedelta(days=1)
     if d.weekday() == 6:
         return d - pd.Timedelta(days=2)
     return d
+
 
 def add_business_days(d: pd.Timestamp, n: int) -> pd.Timestamp:
     cur = d
@@ -325,6 +362,7 @@ def add_business_days(d: pd.Timestamp, n: int) -> pd.Timestamp:
         if cur.weekday() < 5:
             remaining -= 1
     return cur
+
 
 def months_step_from_periodicidad(periodicidad: str) -> int:
     p = (periodicidad or "").upper().strip()
@@ -337,6 +375,7 @@ def months_step_from_periodicidad(periodicidad: str) -> int:
     if p == "SEMESTRAL":
         return 6
     return 1
+
 
 def resolve_base_date_for_row(r: pd.Series, reference_start: pd.Timestamp) -> Optional[pd.Timestamp]:
     periodicidad = str(r.get("PERIODICIDAD", "")).upper().strip()
@@ -364,6 +403,7 @@ def resolve_base_date_for_row(r: pd.Series, reference_start: pd.Timestamp) -> Op
 
     return pd.NaT
 
+
 def apply_row_adjustments(d: pd.Timestamp, ajuste: str, lag: int) -> pd.Timestamp:
     if pd.isna(d):
         return d
@@ -379,6 +419,7 @@ def apply_row_adjustments(d: pd.Timestamp, ajuste: str, lag: int) -> pd.Timestam
         d = add_business_days(d, lag)
 
     return d.normalize()
+
 
 def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
@@ -550,6 +591,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
     )
     return out.sort_values("FECHA").reset_index(drop=True)
 
+
 def build_real_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
     rows = []
@@ -609,6 +651,7 @@ def build_real_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timesta
     out = out.sort_values(["FECHA", "CONCEPTO", "CLIENTE"]).reset_index(drop=True)
     return out
 
+
 def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amount_col: str) -> pd.DataFrame:
     df = df.copy()
     df["COBROS"] = df.apply(lambda x: x[amount_col] if x["TIPO"] == "INGRESO" else 0.0, axis=1)
@@ -616,6 +659,7 @@ def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amoun
     df["NETO"] = df["COBROS"] - df["PAGOS"]
     df["SALDO"] = starting_balance + df["NETO"].cumsum()
     return df
+
 
 st.sidebar.header("Inputs")
 saldo_fecha = st.sidebar.date_input("Fecha del saldo (hoy)", value=date.today())
@@ -789,6 +833,7 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
 else:
     d_from, d_to = min_d, max_d
 
+
 def apply_visual_filters(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out = out[(out["FECHA"].dt.date >= d_from) & (out["FECHA"].dt.date <= d_to)].copy()
@@ -810,19 +855,35 @@ def apply_visual_filters(df: pd.DataFrame) -> pd.DataFrame:
 
     return out.sort_values("FECHA").reset_index(drop=True)
 
+
 view_pron = apply_visual_filters(consolidado_pron2)
 view_real = apply_visual_filters(consolidado_real2)
 
-c1, c2, c3, c4 = st.columns(4)
+# -----------------------------
+# KPIs
+# -----------------------------
+saldo_pron_final = consolidado_pron["SALDO"].iloc[-1] if not consolidado_pron.empty else saldo_hoy
+saldo_real_final = consolidado_real["SALDO"].iloc[-1] if not consolidado_real.empty else saldo_hoy
+desviacion_total = saldo_real_final - saldo_pron_final
+desviacion_total_pct = safe_deviation_pct(saldo_real_final, saldo_pron_final)
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 with c1:
     st.metric("Saldo inicial (TOTAL BANCOS)", eur(saldo_hoy))
 with c2:
     st.metric("Neto periodo (PRON, pendientes)", eur(consolidado_pron["NETO"].sum() if not consolidado_pron.empty else 0.0))
 with c3:
-    st.metric("Saldo final (PRON, pendientes)", eur(consolidado_pron["SALDO"].iloc[-1] if not consolidado_pron.empty else saldo_hoy))
+    st.metric("Saldo final (PRON, pendientes)", eur(saldo_pron_final))
 with c4:
-    st.metric("Saldo final (REAL, estimado/ejecutado)", eur(consolidado_real["SALDO"].iloc[-1] if not consolidado_real.empty else saldo_hoy))
+    st.metric("Saldo final (REAL, estimado/ejecutado)", eur(saldo_real_final))
+with c5:
+    st.metric("Desviación PRON vs REAL", eur(desviacion_total))
+with c6:
+    st.metric("Desviación %", pct(desviacion_total_pct))
 
+# -----------------------------
+# Gráfico diario
+# -----------------------------
 st.subheader("Evolución de saldo — diario (Pronosticado vs Real)")
 
 d_pron = consolidado_pron2[["FECHA", "SALDO"]].copy()
@@ -839,6 +900,17 @@ all_days = pd.date_range(start=daily["FECHA"].min(), end=daily["FECHA"].max(), f
 daily = daily.set_index("FECHA").reindex(all_days).rename_axis("FECHA").reset_index()
 daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(saldo_hoy)
 daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(saldo_hoy)
+
+daily["DESVIACION"] = daily["SALDO_REAL"] - daily["SALDO_PRON"]
+
+# Bandas de sombreado entre líneas
+daily["AREA_POS_TOP"] = daily[["SALDO_REAL", "SALDO_PRON"]].max(axis=1)
+daily["AREA_POS_BOTTOM"] = daily[["SALDO_REAL", "SALDO_PRON"]].min(axis=1)
+daily["AREA_NEG_TOP"] = daily["AREA_POS_TOP"]
+daily["AREA_NEG_BOTTOM"] = daily["AREA_POS_BOTTOM"]
+
+daily.loc[daily["DESVIACION"] < 0, ["AREA_POS_TOP", "AREA_POS_BOTTOM"]] = pd.NA
+daily.loc[daily["DESVIACION"] >= 0, ["AREA_NEG_TOP", "AREA_NEG_BOTTOM"]] = pd.NA
 
 if cuenta_suplidos is not None:
     daily["LINEA_SUPLIDOS"] = float(cuenta_suplidos)
@@ -870,10 +942,54 @@ plot_df = daily_zoom.melt(
 )
 plot_df["SERIE"] = plot_df["SERIE"].map(series_map)
 
-domain = ["Pronosticado (pendiente)", "Real (estimado/ejecutado)", "Cuenta efectivo", "Cuenta suplidos"]
-range_ = ["#6BAED6", "#08519C", "#FF7F0E", "#D62728"]
+domain = [
+    "Pronosticado (pendiente)",
+    "Real (estimado/ejecutado)",
+    "Cuenta efectivo",
+    "Cuenta suplidos",
+]
+range_ = [
+    "#6BAED6",  # PRON
+    "#08519C",  # REAL
+    "#FF7F0E",  # EFECTIVO
+    "#8A2BE2",  # SUPLIDOS violeta
+]
 
-chart = (
+# Área verde: REAL > PRON
+area_pos = (
+    alt.Chart(daily_zoom)
+    .mark_area(color="#1A9850", opacity=0.16)
+    .encode(
+        x=alt.X("FECHA:T", title="Fecha"),
+        y=alt.Y("AREA_POS_TOP:Q", title="Saldo"),
+        y2="AREA_POS_BOTTOM:Q",
+        tooltip=[
+            alt.Tooltip("FECHA:T", title="Fecha"),
+            alt.Tooltip("SALDO_REAL:Q", title="Saldo real", format=",.2f"),
+            alt.Tooltip("SALDO_PRON:Q", title="Saldo pron", format=",.2f"),
+            alt.Tooltip("DESVIACION:Q", title="Desviación", format=",.2f"),
+        ],
+    )
+)
+
+# Área roja: REAL < PRON
+area_neg = (
+    alt.Chart(daily_zoom)
+    .mark_area(color="#D73027", opacity=0.16)
+    .encode(
+        x=alt.X("FECHA:T", title="Fecha"),
+        y=alt.Y("AREA_NEG_TOP:Q", title="Saldo"),
+        y2="AREA_NEG_BOTTOM:Q",
+        tooltip=[
+            alt.Tooltip("FECHA:T", title="Fecha"),
+            alt.Tooltip("SALDO_REAL:Q", title="Saldo real", format=",.2f"),
+            alt.Tooltip("SALDO_PRON:Q", title="Saldo pron", format=",.2f"),
+            alt.Tooltip("DESVIACION:Q", title="Desviación", format=",.2f"),
+        ],
+    )
+)
+
+lines = (
     alt.Chart(plot_df)
     .mark_line()
     .encode(
@@ -886,10 +1002,14 @@ chart = (
             alt.Tooltip("SALDO:Q", title="Saldo", format=",.2f"),
         ],
     )
-    .properties(height=340)
 )
+
+chart = alt.layer(area_pos, area_neg, lines).properties(height=340)
 st.altair_chart(chart, use_container_width=True)
 
+# -----------------------------
+# Movimientos — PRON
+# -----------------------------
 st.subheader("Movimientos (formato tesorería) — PRON (pendientes)")
 
 mov_pron = view_pron.copy()
@@ -911,6 +1031,9 @@ styled_pron = (
 )
 st.dataframe(styled_pron, use_container_width=True)
 
+# -----------------------------
+# Movimientos — REAL
+# -----------------------------
 st.subheader("Movimientos (formato tesorería) — REAL (estimado/ejecutado)")
 
 mov_real = view_real.copy()
@@ -932,6 +1055,9 @@ styled_real = (
 )
 st.dataframe(styled_real, use_container_width=True)
 
+# -----------------------------
+# Resumen mensual
+# -----------------------------
 st.subheader("Resumen mensual")
 
 modo_resumen = st.radio(
@@ -940,6 +1066,7 @@ modo_resumen = st.radio(
     index=0,
     horizontal=True
 )
+
 
 def resumen_mensual(df_base: pd.DataFrame, d_from: date, d_to: date) -> pd.DataFrame:
     df = df_base.copy()
@@ -956,13 +1083,16 @@ def resumen_mensual(df_base: pd.DataFrame, d_from: date, d_to: date) -> pd.DataF
     )
     return monthly_visible.merge(monthly_close, on="MES", how="left")
 
+
 monthly_pron = resumen_mensual(consolidado_pron2, d_from, d_to)
 monthly_real = resumen_mensual(consolidado_real2, d_from, d_to)
+
 
 def show_monthly_table(df: pd.DataFrame, titulo: str):
     st.markdown(f"#### {titulo}")
     styled = df.style.format({c: eur for c in df.columns if c != "MES"})
     st.dataframe(styled, use_container_width=True)
+
 
 if modo_resumen == "REAL":
     show_monthly_table(monthly_real, "Resumen mensual — REAL (estimado/ejecutado)")
@@ -972,6 +1102,9 @@ else:
     show_monthly_table(monthly_real, "Resumen mensual — REAL (estimado/ejecutado)")
     show_monthly_table(monthly_pron, "Resumen mensual — PRON (pendientes)")
 
+# -----------------------------
+# Exportar a Excel
+# -----------------------------
 st.subheader("Exportar (lo visible)")
 
 export_mov_pron = mov_pron_out.copy()
@@ -987,6 +1120,7 @@ for df_exp in (export_month_pron, export_month_real):
     for c in ["COBROS", "PAGOS", "NETO", "SALDO_CIERRE"]:
         df_exp[c] = pd.to_numeric(df_exp[c], errors="coerce")
 
+
 def build_excel_bytes(
     df_mov_pron: pd.DataFrame,
     df_mov_real: pd.DataFrame,
@@ -1001,6 +1135,7 @@ def build_excel_bytes(
         df_month_real.to_excel(writer, index=False, sheet_name="Resumen_REAL")
     bio.seek(0)
     return bio.read()
+
 
 xlsx_bytes = build_excel_bytes(export_mov_pron, export_mov_real, export_month_pron, export_month_real)
 
