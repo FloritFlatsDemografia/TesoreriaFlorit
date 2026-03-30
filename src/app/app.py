@@ -180,6 +180,26 @@ def safe_deviation_pct(real_value: float, pron_value: float) -> float:
         return 0.0
 
 
+def coalesce_cliente_empresa(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Unifica el campo visible de cliente/proveedor:
+    - prioriza CLIENTE
+    - si CLIENTE está vacío, usa EMPRESA
+    """
+    df = df.copy()
+
+    if "CLIENTE" not in df.columns:
+        df["CLIENTE"] = ""
+    if "EMPRESA" not in df.columns:
+        df["EMPRESA"] = ""
+
+    cliente = df["CLIENTE"].fillna("").astype(str).str.strip()
+    empresa = df["EMPRESA"].fillna("").astype(str).str.strip()
+
+    df["CLIENTE"] = cliente.mask(cliente.eq(""), empresa)
+    return df
+
+
 # -----------------------------
 # Leer hoja BANCOS
 # -----------------------------
@@ -288,10 +308,14 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
         "REGLA_FECHA",
         "AJUSTE FINDE",
         "CLIENTE",
+        "EMPRESA",
     ]:
         if c not in df.columns:
             df[c] = ""
         df[c] = df[c].astype(str).str.strip()
+
+    # Unificar CLIENTE usando EMPRESA si hace falta
+    df = coalesce_cliente_empresa(df)
 
     df["TIPO"] = df["TIPO"].str.upper()
     df["DEPARTAMENTO"] = df["DEPARTAMENTO"].str.upper()
@@ -566,8 +590,9 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
 
     if not rows:
         return pd.DataFrame(columns=[
-            "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "CLIENTE", "IMPORTE_PRON", "IMPORTE_REAL",
-            "NATURALEZA", "PAGADO_BOOL", "FECHA_PAGO", "PRORRATEO", "ESTATUS"
+            "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "CLIENTE", "EMPRESA",
+            "IMPORTE_PRON", "IMPORTE_REAL", "NATURALEZA", "PAGADO_BOOL",
+            "FECHA_PAGO", "PRORRATEO", "ESTATUS"
         ])
 
     out = pd.DataFrame([{
@@ -576,6 +601,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         "TIPO": rr["TIPO"],
         "DEPARTAMENTO": rr["DEPARTAMENTO"],
         "CLIENTE": rr.get("CLIENTE", ""),
+        "EMPRESA": rr.get("EMPRESA", ""),
         "IMPORTE_PRON": float(rr.get("IMPORTE_PRON", 0.0)),
         "IMPORTE_REAL": float(rr.get("IMPORTE_REAL", 0.0)),
         "NATURALEZA": rr.get("NATURALEZA", ""),
@@ -584,6 +610,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         "PRORRATEO": str(rr.get("PRORRATEO", "")).upper().strip(),
     } for d, rr in rows])
 
+    out = coalesce_cliente_empresa(out)
     out["FECHA_PAGO"] = pd.to_datetime(out["FECHA_PAGO"], errors="coerce").dt.normalize()
     out["ESTATUS"] = out.apply(
         lambda x: estado_cobro_pago(x.get("TIPO", ""), bool(x.get("PAGADO_BOOL", False))),
@@ -630,6 +657,7 @@ def build_real_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timesta
             "TIPO": r.get("TIPO", ""),
             "DEPARTAMENTO": r.get("DEPARTAMENTO", ""),
             "CLIENTE": r.get("CLIENTE", ""),
+            "EMPRESA": r.get("EMPRESA", ""),
             "IMPORTE_PRON": float(r.get("IMPORTE_PRON", 0.0)),
             "IMPORTE_REAL": importe_real,
             "NATURALEZA": r.get("NATURALEZA", ""),
@@ -641,11 +669,13 @@ def build_real_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timesta
 
     if not rows:
         return pd.DataFrame(columns=[
-            "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "CLIENTE", "IMPORTE_PRON", "IMPORTE_REAL",
-            "NATURALEZA", "PAGADO_BOOL", "FECHA_PAGO", "PRORRATEO", "ESTATUS"
+            "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "CLIENTE", "EMPRESA",
+            "IMPORTE_PRON", "IMPORTE_REAL", "NATURALEZA", "PAGADO_BOOL",
+            "FECHA_PAGO", "PRORRATEO", "ESTATUS"
         ])
 
     out = pd.DataFrame(rows)
+    out = coalesce_cliente_empresa(out)
     out["FECHA"] = pd.to_datetime(out["FECHA"], errors="coerce").dt.normalize()
     out["FECHA_PAGO"] = pd.to_datetime(out["FECHA_PAGO"], errors="coerce").dt.normalize()
     out = out.sort_values(["FECHA", "CONCEPTO", "CLIENTE"]).reset_index(drop=True)
@@ -791,6 +821,7 @@ base_row = pd.DataFrame([{
     "TIPO": "SALDO",
     "DEPARTAMENTO": "",
     "CLIENTE": "",
+    "EMPRESA": "",
     "IMPORTE_PRON": 0.0,
     "IMPORTE_REAL": 0.0,
     "NATURALEZA": "SALDO",
@@ -807,9 +838,13 @@ base_row = pd.DataFrame([{
 consolidado_pron2 = pd.concat([base_row, consolidado_pron], ignore_index=True) if not consolidado_pron.empty else base_row.copy()
 consolidado_real2 = pd.concat([base_row, consolidado_real], ignore_index=True) if not consolidado_real.empty else base_row.copy()
 
+# Asegurar otra vez que CLIENTE esté relleno también en los consolidados
+consolidado_pron2 = coalesce_cliente_empresa(consolidado_pron2)
+consolidado_real2 = coalesce_cliente_empresa(consolidado_real2)
+
 st.sidebar.header("Búsqueda y rango (solo visualización)")
 q_concepto = st.sidebar.text_input("Buscar concepto", value="").strip()
-q_cliente = st.sidebar.text_input("Buscar cliente", value="").strip()
+q_cliente = st.sidebar.text_input("Buscar cliente / proveedor", value="").strip()
 
 estatus_options = ["PAGADO", "COBRADO", "PENDIENTE"]
 sel_estatus = st.sidebar.multiselect(
@@ -836,6 +871,8 @@ else:
 
 def apply_visual_filters(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    out = coalesce_cliente_empresa(out)
+
     out = out[(out["FECHA"].dt.date >= d_from) & (out["FECHA"].dt.date <= d_to)].copy()
 
     if q_concepto:
@@ -955,6 +992,9 @@ range_ = [
     "#8A2BE2",  # SUPLIDOS violeta
 ]
 
+# Selección interactiva para zoom/pan
+chart_interval = alt.selection_interval(bind="scales")
+
 # Área verde: REAL > PRON
 area_pos = (
     alt.Chart(daily_zoom)
@@ -1004,8 +1044,16 @@ lines = (
     )
 )
 
-chart = alt.layer(area_pos, area_neg, lines).properties(height=340)
+chart = (
+    alt.layer(area_pos, area_neg, lines)
+    .add_params(chart_interval)
+    .interactive()
+    .properties(height=420)
+)
+
 st.altair_chart(chart, use_container_width=True)
+
+st.caption("Puedes hacer zoom y desplazarte dentro del gráfico. El rango de fechas del lateral sigue actuando como filtro base.")
 
 # -----------------------------
 # Movimientos — PRON
@@ -1013,6 +1061,7 @@ st.altair_chart(chart, use_container_width=True)
 st.subheader("Movimientos (formato tesorería) — PRON (pendientes)")
 
 mov_pron = view_pron.copy()
+mov_pron = coalesce_cliente_empresa(mov_pron)
 mov_pron["VTO. PAGO"] = mov_pron["FECHA"].dt.strftime("%d-%m-%y")
 mov_pron["COBRADO/PAGADO"] = mov_pron["ESTATUS"]
 
@@ -1037,6 +1086,7 @@ st.dataframe(styled_pron, use_container_width=True)
 st.subheader("Movimientos (formato tesorería) — REAL (estimado/ejecutado)")
 
 mov_real = view_real.copy()
+mov_real = coalesce_cliente_empresa(mov_real)
 mov_real["VTO. PAGO"] = mov_real["FECHA"].dt.strftime("%d-%m-%y")
 mov_real["COBRADO/PAGADO"] = mov_real["ESTATUS"]
 
