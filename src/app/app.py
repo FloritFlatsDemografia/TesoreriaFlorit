@@ -167,10 +167,6 @@ def concept_has_explicit_month(concepto: str) -> bool:
 
 
 def safe_deviation_pct(real_value: float, pron_value: float) -> float:
-    """
-    Desviación % tomando PRON como base, pero usando el valor absoluto
-    del denominador para que el signo sea intuitivo incluso con saldos negativos.
-    """
     try:
         denom = abs(float(pron_value))
         if denom == 0:
@@ -181,11 +177,6 @@ def safe_deviation_pct(real_value: float, pron_value: float) -> float:
 
 
 def coalesce_cliente_empresa(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Unifica el campo visible de cliente/proveedor:
-    - prioriza CLIENTE
-    - si CLIENTE está vacío, usa EMPRESA
-    """
     df = df.copy()
 
     if "CLIENTE" not in df.columns:
@@ -193,11 +184,52 @@ def coalesce_cliente_empresa(df: pd.DataFrame) -> pd.DataFrame:
     if "EMPRESA" not in df.columns:
         df["EMPRESA"] = ""
 
-    cliente = df["CLIENTE"].fillna("").astype(str).str.strip()
-    empresa = df["EMPRESA"].fillna("").astype(str).str.strip()
+    cliente = df["CLIENTE"].where(pd.notna(df["CLIENTE"]), "").astype(str).str.strip()
+    empresa = df["EMPRESA"].where(pd.notna(df["EMPRESA"]), "").astype(str).str.strip()
+
+    cliente = cliente.replace({"nan": "", "None": ""})
+    empresa = empresa.replace({"nan": "", "None": ""})
 
     df["CLIENTE"] = cliente.mask(cliente.eq(""), empresa)
+    df["CLIENTE"] = df["CLIENTE"].replace({"nan": "", "None": ""}).fillna("")
+
     return df
+
+
+def get_saldo_en_fecha(df: pd.DataFrame, fecha: pd.Timestamp, saldo_inicial: float) -> float:
+    if df.empty:
+        return saldo_inicial
+    tmp = df.copy()
+    tmp["FECHA"] = pd.to_datetime(tmp["FECHA"], errors="coerce").dt.normalize()
+    tmp = tmp[tmp["FECHA"] <= fecha].sort_values("FECHA")
+    if tmp.empty or "SALDO" not in tmp.columns:
+        return saldo_inicial
+    return float(tmp["SALDO"].iloc[-1])
+
+
+def get_gastos_relevantes(df: pd.DataFrame, fecha_base: pd.Timestamp, dias: int = 30, umbral: float = 3000.0) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    tmp = df.copy()
+    tmp["FECHA"] = pd.to_datetime(tmp["FECHA"], errors="coerce").dt.normalize()
+
+    if "PAGOS" not in tmp.columns:
+        tmp["PAGOS"] = 0.0
+
+    tmp["PAGOS"] = pd.to_numeric(tmp["PAGOS"], errors="coerce").fillna(0.0)
+
+    tmp = tmp[
+        (tmp["TIPO"].astype(str).str.upper() == "GASTO") &
+        (tmp["FECHA"] >= fecha_base) &
+        (tmp["FECHA"] <= fecha_base + pd.Timedelta(days=dias)) &
+        (tmp["PAGOS"] >= umbral)
+    ].copy()
+
+    tmp["DIAS"] = (tmp["FECHA"] - fecha_base).dt.days
+    tmp = tmp.sort_values(["FECHA", "PAGOS"], ascending=[True, False])
+
+    return tmp
 
 
 # -----------------------------
@@ -314,7 +346,6 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
             df[c] = ""
         df[c] = df[c].astype(str).str.strip()
 
-    # Unificar CLIENTE usando EMPRESA si hace falta
     df = coalesce_cliente_empresa(df)
 
     df["TIPO"] = df["TIPO"].str.upper()
@@ -691,6 +722,9 @@ def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amoun
     return df
 
 
+# -----------------------------
+# Inputs
+# -----------------------------
 st.sidebar.header("Inputs")
 saldo_fecha = st.sidebar.date_input("Fecha del saldo (hoy)", value=date.today())
 months_horizon = st.sidebar.slider("Horizonte forecast (meses)", min_value=1, max_value=36, value=12)
@@ -761,6 +795,9 @@ if generated_pron.empty and generated_real.empty:
     st.dataframe(catalog.head(50), use_container_width=True)
     st.stop()
 
+# -----------------------------
+# Filtros base
+# -----------------------------
 st.sidebar.header("Filtros base")
 
 all_deptos = sorted(
@@ -838,10 +875,12 @@ base_row = pd.DataFrame([{
 consolidado_pron2 = pd.concat([base_row, consolidado_pron], ignore_index=True) if not consolidado_pron.empty else base_row.copy()
 consolidado_real2 = pd.concat([base_row, consolidado_real], ignore_index=True) if not consolidado_real.empty else base_row.copy()
 
-# Asegurar otra vez que CLIENTE esté relleno también en los consolidados
 consolidado_pron2 = coalesce_cliente_empresa(consolidado_pron2)
 consolidado_real2 = coalesce_cliente_empresa(consolidado_real2)
 
+# -----------------------------
+# Búsqueda y rango
+# -----------------------------
 st.sidebar.header("Búsqueda y rango (solo visualización)")
 q_concepto = st.sidebar.text_input("Buscar concepto", value="").strip()
 q_cliente = st.sidebar.text_input("Buscar cliente / proveedor", value="").strip()
@@ -872,7 +911,6 @@ else:
 def apply_visual_filters(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out = coalesce_cliente_empresa(out)
-
     out = out[(out["FECHA"].dt.date >= d_from) & (out["FECHA"].dt.date <= d_to)].copy()
 
     if q_concepto:
@@ -897,26 +935,84 @@ view_pron = apply_visual_filters(consolidado_pron2)
 view_real = apply_visual_filters(consolidado_real2)
 
 # -----------------------------
-# KPIs
+# KPIs claros a fecha objetivo
 # -----------------------------
-saldo_pron_final = consolidado_pron["SALDO"].iloc[-1] if not consolidado_pron.empty else saldo_hoy
-saldo_real_final = consolidado_real["SALDO"].iloc[-1] if not consolidado_real.empty else saldo_hoy
-desviacion_total = saldo_real_final - saldo_pron_final
-desviacion_total_pct = safe_deviation_pct(saldo_real_final, saldo_pron_final)
+fecha_objetivo = pd.Timestamp(d_to).normalize()
+
+saldo_pron_obj = get_saldo_en_fecha(consolidado_pron2, fecha_objetivo, saldo_hoy)
+saldo_real_obj = get_saldo_en_fecha(consolidado_real2, fecha_objetivo, saldo_hoy)
+
+gap = saldo_real_obj - saldo_pron_obj
+gap_pct = safe_deviation_pct(saldo_real_obj, saldo_pron_obj)
+
+pagos_pendientes_hasta = 0.0
+cobros_pendientes_hasta = 0.0
+
+if not pron_df.empty:
+    pron_hasta_obj = pron_df[pron_df["FECHA"] <= fecha_objetivo].copy()
+    if not pron_hasta_obj.empty:
+        pron_hasta_obj = compute_balance_from_amount(pron_hasta_obj, saldo_hoy, "IMPORTE_PRON")
+        pagos_pendientes_hasta = float(pron_hasta_obj["PAGOS"].sum())
+        cobros_pendientes_hasta = float(pron_hasta_obj["COBROS"].sum())
+
+gastos_alerta = get_gastos_relevantes(view_pron, start_ts, dias=30, umbral=3000.0)
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
+
 with c1:
-    st.metric("Saldo inicial (TOTAL BANCOS)", eur(saldo_hoy))
+    st.metric("Saldo hoy", eur(saldo_hoy))
+
 with c2:
-    st.metric("Neto periodo (PRON, pendientes)", eur(consolidado_pron["NETO"].sum() if not consolidado_pron.empty else 0.0))
+    st.metric(f"Previsto al {fecha_objetivo.strftime('%d-%m-%Y')}", eur(saldo_pron_obj))
+
 with c3:
-    st.metric("Saldo final (PRON, pendientes)", eur(saldo_pron_final))
+    st.metric(f"Real al {fecha_objetivo.strftime('%d-%m-%Y')}", eur(saldo_real_obj))
+
 with c4:
-    st.metric("Saldo final (REAL, estimado/ejecutado)", eur(saldo_real_final))
+    st.metric("Gap vs previsión", eur(gap))
+
 with c5:
-    st.metric("Desviación PRON vs REAL", eur(desviacion_total))
+    st.metric("Gap %", pct(gap_pct))
+
 with c6:
-    st.metric("Desviación %", pct(desviacion_total_pct))
+    if not gastos_alerta.empty:
+        g = gastos_alerta.iloc[0]
+        st.metric(
+            "Próximo gasto relevante",
+            eur(g["PAGOS"]),
+            delta=f'{str(g["CONCEPTO"])[:18]} · {int(g["DIAS"])} días'
+        )
+    else:
+        st.metric("Próximo gasto relevante", "—")
+
+c7, c8 = st.columns(2)
+with c7:
+    st.metric(f"Cobros pendientes hasta {fecha_objetivo.strftime('%d-%m-%Y')}", eur(cobros_pendientes_hasta))
+with c8:
+    st.metric(f"Pagos pendientes hasta {fecha_objetivo.strftime('%d-%m-%Y')}", eur(pagos_pendientes_hasta))
+
+# -----------------------------
+# Alertas simples de gastos elevados
+# -----------------------------
+st.subheader("Alertas de gastos elevados")
+
+if gastos_alerta.empty:
+    st.info("No hay gastos elevados en los próximos 30 días con el umbral actual (3.000 €).")
+else:
+    alertas_out = gastos_alerta[["FECHA", "CONCEPTO", "CLIENTE", "PAGOS", "DIAS"]].copy()
+    alertas_out["FECHA"] = pd.to_datetime(alertas_out["FECHA"]).dt.strftime("%d-%m-%Y")
+    alertas_out = alertas_out.rename(columns={
+        "FECHA": "Fecha",
+        "CONCEPTO": "Concepto",
+        "CLIENTE": "Cliente / Proveedor",
+        "PAGOS": "Importe",
+        "DIAS": "En"
+    })
+    styled_alertas = alertas_out.style.format({
+        "Importe": eur,
+        "En": lambda x: f"{int(x)} días"
+    })
+    st.dataframe(styled_alertas, use_container_width=True)
 
 # -----------------------------
 # Gráfico diario
@@ -940,7 +1036,6 @@ daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(saldo_hoy)
 
 daily["DESVIACION"] = daily["SALDO_REAL"] - daily["SALDO_PRON"]
 
-# Bandas de sombreado entre líneas
 daily["AREA_POS_TOP"] = daily[["SALDO_REAL", "SALDO_PRON"]].max(axis=1)
 daily["AREA_POS_BOTTOM"] = daily[["SALDO_REAL", "SALDO_PRON"]].min(axis=1)
 daily["AREA_NEG_TOP"] = daily["AREA_POS_TOP"]
@@ -986,16 +1081,14 @@ domain = [
     "Cuenta suplidos",
 ]
 range_ = [
-    "#6BAED6",  # PRON
-    "#08519C",  # REAL
-    "#FF7F0E",  # EFECTIVO
-    "#8A2BE2",  # SUPLIDOS violeta
+    "#6BAED6",
+    "#08519C",
+    "#FF7F0E",
+    "#8A2BE2",
 ]
 
-# Selección interactiva para zoom/pan
 chart_interval = alt.selection_interval(bind="scales")
 
-# Área verde: REAL > PRON
 area_pos = (
     alt.Chart(daily_zoom)
     .mark_area(color="#1A9850", opacity=0.16)
@@ -1012,7 +1105,6 @@ area_pos = (
     )
 )
 
-# Área roja: REAL < PRON
 area_neg = (
     alt.Chart(daily_zoom)
     .mark_area(color="#D73027", opacity=0.16)
@@ -1052,8 +1144,7 @@ chart = (
 )
 
 st.altair_chart(chart, use_container_width=True)
-
-st.caption("Puedes hacer zoom y desplazarte dentro del gráfico. El rango de fechas del lateral sigue actuando como filtro base.")
+st.caption("El rango de fechas del lateral actúa como filtro base. El gap se calcula sobre la fecha final exacta del rango seleccionado.")
 
 # -----------------------------
 # Movimientos — PRON
