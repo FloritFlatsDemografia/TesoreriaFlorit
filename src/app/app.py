@@ -70,6 +70,7 @@ def apply_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
     alias_map = {
         "PREVISION": "IMPORTE PRONOSTICADO",
         "IMPORTE_PRONOSTICADO": "IMPORTE PRONOSTICADO",
+        "IMPORTE REAL": "IMPORTE REAL",
         "IMPORTE_REAL": "IMPORTE REAL",
         "FECHA_CARGO_GASTO": "FECHA CARGO GASTO",
         "AJUSTE_FINDE": "AJUSTE FINDE",
@@ -436,8 +437,13 @@ def months_step_from_periodicidad(periodicidad: str) -> int:
 
 
 def resolve_base_date_for_row(r: pd.Series, reference_start: pd.Timestamp) -> Optional[pd.Timestamp]:
-    periodicidad = str(r.get("PERIODICIDAD", "")).upper().strip()
     regla = str(r.get("REGLA_FECHA", "")).upper().strip()
+
+    fecha_cargo = r.get("FECHA_CARGO_GASTO_DT", pd.NaT)
+    if pd.notna(fecha_cargo):
+        return pd.Timestamp(fecha_cargo).normalize()
+
+    periodicidad = str(r.get("PERIODICIDAD", "")).upper().strip()
 
     if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF", "ANUAL", "SEMANAL"):
         if pd.notna(r.get("FECHA_FIJA")):
@@ -479,52 +485,157 @@ def apply_row_adjustments(d: pd.Timestamp, ajuste: str, lag: int) -> pd.Timestam
     return d.normalize()
 
 
-def get_forecast_event_date(r: pd.Series, start_date: pd.Timestamp) -> pd.Timestamp:
-    fecha_cargo = r.get("FECHA_CARGO_GASTO_DT", pd.NaT)
-
-    if pd.notna(fecha_cargo):
-        return pd.Timestamp(fecha_cargo).normalize()
-
-    fecha_base = resolve_base_date_for_row(r, start_date)
-    if pd.isna(fecha_base):
-        return pd.NaT
-
-    ajuste = str(r.get("AJUSTE FINDE", "")).upper().strip()
-    lag = int(r.get("LAG", 0))
-    return apply_row_adjustments(fecha_base, ajuste, lag)
-
-
 def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
     rows = []
 
     for _, r in catalog.iterrows():
-        fecha_evento = get_forecast_event_date(r, start_date)
-        if pd.isna(fecha_evento):
-            continue
+        periodicidad = str(r.get("PERIODICIDAD", "")).upper().strip()
+        regla = str(r.get("REGLA_FECHA", "")).upper().strip()
+        ajuste = str(r.get("AJUSTE FINDE", "")).upper().strip()
+        lag = int(r.get("LAG", 0))
+        prorrateo = str(r.get("PRORRATEO", "")).upper().strip()
+        concepto = str(r.get("GENERAL", "")).strip()
+        force_single_event = concept_has_explicit_month(concepto)
 
         hasta = r.get("HASTA", pd.NaT)
         hasta = pd.Timestamp(hasta).normalize() if not pd.isna(hasta) else pd.NaT
 
-        if fecha_evento < start_date or fecha_evento > end_date:
-            continue
-        if not pd.isna(hasta) and fecha_evento > hasta:
+        def apply_adjustments(d: pd.Timestamp) -> pd.Timestamp:
+            return apply_row_adjustments(d, ajuste, lag)
+
+        def within_limits(d: pd.Timestamp) -> bool:
+            if d < start_date or d > end_date:
+                return False
+            if not pd.isna(hasta) and d > hasta:
+                return False
+            return True
+
+        def add_one(d_base: pd.Timestamp):
+            d_base = pd.Timestamp(d_base).normalize()
+            if not within_limits(d_base):
+                return
+            d_adj = apply_adjustments(d_base)
+            if d_adj < start_date or d_adj > end_date:
+                return
+            rows.append((d_adj, r))
+
+        def add_prorrateo_diario_for_month(d_base: pd.Timestamp):
+            d_base = pd.Timestamp(d_base).normalize()
+            y, m = d_base.year, d_base.month
+            month_start = pd.Timestamp(year=y, month=m, day=1).normalize()
+            month_end = (month_start + pd.offsets.MonthEnd(0)).normalize()
+            days_in_month = int((month_end - month_start).days) + 1
+            if days_in_month <= 0:
+                return
+
+            imp_pron_day = float(r.get("IMPORTE_PRON", 0.0)) / days_in_month
+            imp_real_day = float(r.get("IMPORTE_REAL", 0.0)) / days_in_month
+
+            d = month_start
+            while d <= month_end:
+                if not within_limits(d):
+                    d += pd.Timedelta(days=1)
+                    continue
+                rr = r.copy()
+                rr["IMPORTE_PRON"] = imp_pron_day
+                rr["IMPORTE_REAL"] = imp_real_day
+                rows.append((d.normalize(), rr))
+                d += pd.Timedelta(days=1)
+
+        if force_single_event:
+            fecha_base = resolve_base_date_for_row(r, start_date)
+            if pd.notna(fecha_base):
+                add_one(fecha_base)
             continue
 
-        rows.append({
-            "FECHA": fecha_evento,
-            "CONCEPTO": r.get("GENERAL", ""),
-            "TIPO": r.get("TIPO", ""),
-            "DEPARTAMENTO": r.get("DEPARTAMENTO", ""),
-            "CLIENTE": r.get("CLIENTE", ""),
-            "EMPRESA": r.get("EMPRESA", ""),
-            "IMPORTE_PRON": float(r.get("IMPORTE_PRON", 0.0)),
-            "IMPORTE_REAL": float(r.get("IMPORTE_REAL", 0.0)),
-            "NATURALEZA": r.get("NATURALEZA", ""),
-            "PAGADO_BOOL": bool(r.get("PAGADO_BOOL", False)),
-            "FECHA_PAGO": r.get("FECHA_PAGO", pd.NaT),
-            "PRORRATEO": str(r.get("PRORRATEO", "")).upper().strip(),
-        })
+        if periodicidad in ("PUNTUAL", "ONE-OFF", "ONEOFF"):
+            fecha_base = resolve_base_date_for_row(r, start_date)
+            if pd.notna(fecha_base):
+                add_one(fecha_base)
+            continue
+
+        if periodicidad == "ANUAL":
+            fecha_base = resolve_base_date_for_row(r, start_date)
+            if pd.isna(fecha_base):
+                continue
+            base = pd.Timestamp(fecha_base).normalize()
+            year = start_date.year
+            while True:
+                try:
+                    candidate = pd.Timestamp(year=year, month=base.month, day=base.day)
+                except Exception:
+                    break
+                if candidate > end_date:
+                    break
+                add_one(candidate.normalize())
+                year += 1
+            continue
+
+        if periodicidad == "SEMANAL":
+            fecha_base = resolve_base_date_for_row(r, start_date)
+            if pd.isna(fecha_base):
+                continue
+            anchor = pd.Timestamp(fecha_base).normalize()
+
+            if not pd.isna(hasta):
+                stop = min(hasta, end_date)
+            else:
+                month_start = anchor.replace(day=1)
+                stop = (month_start + pd.offsets.MonthEnd(0)).normalize()
+                stop = min(stop, end_date)
+
+            d = anchor
+            while d <= stop:
+                add_one(d.normalize())
+                d = d + pd.Timedelta(days=7)
+            continue
+
+        if periodicidad in ("MENSUAL", "BIMESTRAL", "BIMENSUAL", "TRIMESTRAL", "SEMESTRAL"):
+            step = months_step_from_periodicidad(periodicidad)
+
+            fecha_cargo = r.get("FECHA_CARGO_GASTO_DT", pd.NaT)
+
+            if pd.notna(fecha_cargo):
+                base_date = pd.Timestamp(fecha_cargo).normalize()
+                anchor_day = base_date.day
+            elif pd.notna(r.get("FECHA_FIJA")):
+                base_date = pd.Timestamp(r["FECHA_FIJA"]).normalize()
+                anchor_day = base_date.day
+            else:
+                day = r.get("DIA_MES")
+                if not day or pd.isna(day):
+                    continue
+                y0, m0 = start_date.year, start_date.month
+                last_day0 = (pd.Timestamp(year=y0, month=m0, day=1) + pd.offsets.MonthEnd(0)).day
+                base_date = pd.Timestamp(year=y0, month=m0, day=min(int(day), int(last_day0))).normalize()
+                anchor_day = base_date.day
+
+            current = base_date
+
+            while current <= end_date:
+                y, m = current.year, current.month
+
+                if pd.notna(fecha_cargo):
+                    last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
+                    d_base = pd.Timestamp(year=y, month=m, day=min(int(anchor_day), int(last_day))).normalize()
+                elif regla in ("DIA_MES", "FECHA_FIJA"):
+                    last_day = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).day
+                    d_base = pd.Timestamp(year=y, month=m, day=min(int(anchor_day), int(last_day))).normalize()
+                elif regla == "ULTIMO_HABIL":
+                    d_base = (pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)).normalize()
+                    d_base = previous_business_day(d_base).normalize()
+                else:
+                    d_base = None
+
+                if d_base is not None:
+                    if prorrateo == "DIARIO":
+                        if within_limits(d_base):
+                            add_prorrateo_diario_for_month(d_base)
+                    else:
+                        add_one(d_base)
+
+                current = (current + pd.DateOffset(months=step)).normalize()
 
     if not rows:
         return pd.DataFrame(columns=[
@@ -533,15 +644,28 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
             "FECHA_PAGO", "PRORRATEO", "ESTATUS"
         ])
 
-    out = pd.DataFrame(rows)
+    out = pd.DataFrame([{
+        "FECHA": d,
+        "CONCEPTO": rr["GENERAL"],
+        "TIPO": rr["TIPO"],
+        "DEPARTAMENTO": rr["DEPARTAMENTO"],
+        "CLIENTE": rr.get("CLIENTE", ""),
+        "EMPRESA": rr.get("EMPRESA", ""),
+        "IMPORTE_PRON": float(rr.get("IMPORTE_PRON", 0.0)),
+        "IMPORTE_REAL": float(rr.get("IMPORTE_REAL", 0.0)),
+        "NATURALEZA": rr.get("NATURALEZA", ""),
+        "PAGADO_BOOL": bool(rr.get("PAGADO_BOOL", False)),
+        "FECHA_PAGO": rr.get("FECHA_PAGO", pd.NaT),
+        "PRORRATEO": str(rr.get("PRORRATEO", "")).upper().strip(),
+    } for d, rr in rows])
+
     out = coalesce_cliente_empresa(out)
-    out["FECHA"] = pd.to_datetime(out["FECHA"], errors="coerce").dt.normalize()
-    out["FECHA_PAGO"] = pd.to_datetime(out["FECHA_PAGO"], errors="coerce", dayfirst=True).dt.normalize()
+    out["FECHA_PAGO"] = pd.to_datetime(out["FECHA_PAGO"], errors="coerce").dt.normalize()
     out["ESTATUS"] = out.apply(
         lambda x: estado_cobro_pago(x.get("TIPO", ""), bool(x.get("PAGADO_BOOL", False))),
         axis=1
     )
-    return out.sort_values(["FECHA", "CONCEPTO", "CLIENTE"]).reset_index(drop=True)
+    return out.sort_values("FECHA").reset_index(drop=True)
 
 
 def build_real_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
