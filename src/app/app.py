@@ -25,7 +25,6 @@ MIN_REQUIRED = [
     "NATURALEZA",
     "PERIODICIDAD",
     "REGLA_FECHA",
-    "VALOR_FECHA",
     "LAG",
     "AJUSTE FINDE",
 ]
@@ -78,6 +77,7 @@ def apply_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
         "VALOR FECHA": "VALOR_FECHA",
         "TRATAMINETO_IVA": "TRATAMIENTO_IVA",
         "TRATAMIENTO IVA": "TRATAMIENTO_IVA",
+        "TRATAMIENTO-IVA": "TRATAMIENTO_IVA",
         "RAIZ_CUENTA_CONTABLE": "RAIZ CUENTA CONTABLE",
         "PERIODO SERVICIO": "PERIODO_SERVICIO",
     }
@@ -232,18 +232,6 @@ def get_gastos_relevantes(df: pd.DataFrame, fecha_base: pd.Timestamp, dias: int 
     return tmp
 
 
-def parse_any_date(value):
-    if pd.isna(value):
-        return pd.NaT
-    try:
-        dt = pd.to_datetime(value, errors="coerce", dayfirst=True)
-        if pd.notna(dt):
-            return pd.Timestamp(dt).normalize()
-    except Exception:
-        pass
-    return pd.NaT
-
-
 # -----------------------------
 # Leer hoja BANCOS
 # -----------------------------
@@ -360,12 +348,12 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
 
     df = coalesce_cliente_empresa(df)
 
-    df["TIPO"] = df["TIPO"].str.upper()
-    df["DEPARTAMENTO"] = df["DEPARTAMENTO"].str.upper()
-    df["NATURALEZA"] = df["NATURALEZA"].str.upper()
-    df["PERIODICIDAD"] = df["PERIODICIDAD"].str.upper()
-    df["REGLA_FECHA"] = df["REGLA_FECHA"].str.upper()
-    df["AJUSTE FINDE"] = df["AJUSTE FINDE"].str.upper()
+    df["TIPO"] = df["TIPO"].astype(str).str.upper()
+    df["DEPARTAMENTO"] = df["DEPARTAMENTO"].astype(str).str.upper()
+    df["NATURALEZA"] = df["NATURALEZA"].astype(str).str.upper()
+    df["PERIODICIDAD"] = df["PERIODICIDAD"].astype(str).str.upper()
+    df["REGLA_FECHA"] = df["REGLA_FECHA"].astype(str).str.upper()
+    df["AJUSTE FINDE"] = df["AJUSTE FINDE"].astype(str).str.upper()
 
     df["IMPORTE_PRON"] = pd.to_numeric(df["IMPORTE PRONOSTICADO"], errors="coerce").fillna(0.0)
     df["IMPORTE_REAL"] = pd.to_numeric(df["IMPORTE REAL"], errors="coerce").fillna(0.0)
@@ -383,6 +371,8 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
                 pass
 
         s = str(v).strip()
+        if s == "":
+            return None
 
         if re.fullmatch(r"\d{1,2}", s):
             d = int(s)
@@ -490,11 +480,6 @@ def apply_row_adjustments(d: pd.Timestamp, ajuste: str, lag: int) -> pd.Timestam
 
 
 def get_forecast_event_date(r: pd.Series, start_date: pd.Timestamp) -> pd.Timestamp:
-    """
-    Regla nueva:
-    La previsión debe seguir FECHA CARGO GASTO cuando exista.
-    Si no existe, usa la lógica anterior.
-    """
     fecha_cargo = r.get("FECHA_CARGO_GASTO_DT", pd.NaT)
 
     if pd.notna(fecha_cargo):
@@ -870,19 +855,14 @@ c1, c2, c3, c4, c5, c6 = st.columns(6)
 
 with c1:
     st.metric("Saldo hoy", eur(saldo_hoy))
-
 with c2:
     st.metric(f"Previsto al {fecha_objetivo.strftime('%d-%m-%Y')}", eur(saldo_pron_obj))
-
 with c3:
     st.metric(f"Real al {fecha_objetivo.strftime('%d-%m-%Y')}", eur(saldo_real_obj))
-
 with c4:
     st.metric("Gap vs previsión", eur(gap))
-
 with c5:
     st.metric("Gap %", pct(gap_pct))
-
 with c6:
     if not gastos_alerta.empty:
         g = gastos_alerta.iloc[0]
