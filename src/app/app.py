@@ -125,12 +125,42 @@ def pct(x):
         return ""
 
 
+def color_saldo(v):
+    try:
+        if pd.isna(v):
+            return ""
+        val = float(v)
+    except Exception:
+        try:
+            s = str(v).replace("€", "").replace(" ", "").replace(",", "")
+            val = float(s)
+        except Exception:
+            return ""
+
+    if val > 0:
+        return "color: green; font-weight: 700;"
+    if val < 0:
+        return "color: red; font-weight: 700;"
+    return ""
+
+
 def estado_cobro_pago(tipo: str, pagado_bool: bool) -> str:
     t = (tipo or "").upper().strip()
     if t == "INGRESO":
         return "COBRADO" if pagado_bool else "PENDIENTE"
     if t == "GASTO":
         return "PAGADO" if pagado_bool else "PENDIENTE"
+    return ""
+
+
+def style_estado(val: str):
+    s = str(val).strip().lower()
+    if s == "pendiente":
+        return "background-color: #FDE6C8; font-weight: 700;"
+    if s == "cobrado":
+        return "background-color: #D8F3DC; color: #0B6E2E; font-weight: 700;"
+    if s == "pagado":
+        return "background-color: #F8D7DA; color: #8A1C1C; font-weight: 700;"
     return ""
 
 
@@ -1011,10 +1041,16 @@ else:
         "PAGOS": "Importe",
         "DIAS": "En"
     })
-    alertas_out = format_currency_columns(alertas_out, ["Importe"])
-    if "En" in alertas_out.columns:
-        alertas_out["En"] = pd.to_numeric(alertas_out["En"], errors="coerce").fillna(0).astype(int).astype(str) + " días"
-    st.dataframe(alertas_out, use_container_width=True)
+
+    styled_alertas = (
+        alertas_out.style
+        .format({
+            "Importe": eur,
+            "En": lambda x: f"{int(x)} días"
+        })
+    )
+
+    st.dataframe(styled_alertas, use_container_width=True)
 
 # -----------------------------
 # Gráfico diario
@@ -1164,8 +1200,15 @@ for c in pron_cols:
         mov_pron[c] = ""
 
 mov_pron_out = mov_pron[pron_cols].copy()
-mov_pron_show = format_currency_columns(mov_pron_out, ["COBROS", "PAGOS", "SALDO"])
-st.dataframe(mov_pron_show, use_container_width=True)
+
+styled_pron = (
+    mov_pron_out.style
+    .format({"COBROS": eur, "PAGOS": eur, "SALDO": eur})
+    .map(style_estado, subset=["COBRADO/PAGADO"])
+    .map(color_saldo, subset=["SALDO"])
+)
+
+st.dataframe(styled_pron, use_container_width=True)
 
 # -----------------------------
 # Movimientos — REAL
@@ -1183,8 +1226,15 @@ for c in real_cols:
         mov_real[c] = ""
 
 mov_real_out = mov_real[real_cols].copy()
-mov_real_show = format_currency_columns(mov_real_out, ["COBROS", "PAGOS", "SALDO"])
-st.dataframe(mov_real_show, use_container_width=True)
+
+styled_real = (
+    mov_real_out.style
+    .format({"COBROS": eur, "PAGOS": eur, "SALDO": eur})
+    .map(style_estado, subset=["COBRADO/PAGADO"])
+    .map(color_saldo, subset=["SALDO"])
+)
+
+st.dataframe(styled_real, use_container_width=True)
 
 # -----------------------------
 # Resumen mensual
@@ -1221,8 +1271,8 @@ monthly_real = resumen_mensual(consolidado_real2, d_from, d_to)
 
 def show_monthly_table(df: pd.DataFrame, titulo: str):
     st.markdown(f"#### {titulo}")
-    df_show = format_currency_columns(df, [c for c in df.columns if c != "MES"])
-    st.dataframe(df_show, use_container_width=True)
+    styled = df.style.format({c: eur for c in df.columns if c != "MES"})
+    st.dataframe(styled, use_container_width=True)
 
 
 if modo_resumen == "REAL":
