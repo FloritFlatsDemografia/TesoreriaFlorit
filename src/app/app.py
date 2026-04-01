@@ -125,35 +125,12 @@ def pct(x):
         return ""
 
 
-def color_saldo(v):
-    try:
-        v = float(v)
-    except Exception:
-        return ""
-    if v > 0:
-        return "color: green; font-weight: 700;"
-    if v < 0:
-        return "color: red; font-weight: 700;"
-    return ""
-
-
 def estado_cobro_pago(tipo: str, pagado_bool: bool) -> str:
     t = (tipo or "").upper().strip()
     if t == "INGRESO":
         return "COBRADO" if pagado_bool else "PENDIENTE"
     if t == "GASTO":
         return "PAGADO" if pagado_bool else "PENDIENTE"
-    return ""
-
-
-def style_estado(val: str):
-    s = str(val).strip().lower()
-    if s == "pendiente":
-        return "background-color: #FDE6C8; font-weight: 700;"
-    if s == "cobrado":
-        return "background-color: #D8F3DC; color: #0B6E2E; font-weight: 700;"
-    if s == "pagado":
-        return "background-color: #F8D7DA; color: #8A1C1C; font-weight: 700;"
     return ""
 
 
@@ -208,7 +185,12 @@ def get_saldo_en_fecha(df: pd.DataFrame, fecha: pd.Timestamp, saldo_inicial: flo
     return float(tmp["SALDO"].iloc[-1])
 
 
-def get_gastos_relevantes(df: pd.DataFrame, fecha_base: pd.Timestamp, dias: int = 30, umbral: float = 3000.0) -> pd.DataFrame:
+def get_gastos_relevantes(
+    df: pd.DataFrame,
+    fecha_base: pd.Timestamp,
+    dias: int = 30,
+    umbral: float = 3000.0
+) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
@@ -231,6 +213,14 @@ def get_gastos_relevantes(df: pd.DataFrame, fecha_base: pd.Timestamp, dias: int 
     tmp = tmp.sort_values(["FECHA", "PAGOS"], ascending=[True, False])
 
     return tmp
+
+
+def format_currency_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").map(eur)
+    return out
 
 
 # -----------------------------
@@ -1021,11 +1011,10 @@ else:
         "PAGOS": "Importe",
         "DIAS": "En"
     })
-    styled_alertas = alertas_out.style.format({
-        "Importe": eur,
-        "En": lambda x: f"{int(x)} días"
-    })
-    st.dataframe(styled_alertas, use_container_width=True)
+    alertas_out = format_currency_columns(alertas_out, ["Importe"])
+    if "En" in alertas_out.columns:
+        alertas_out["En"] = pd.to_numeric(alertas_out["En"], errors="coerce").fillna(0).astype(int).astype(str) + " días"
+    st.dataframe(alertas_out, use_container_width=True)
 
 # -----------------------------
 # Gráfico diario
@@ -1175,14 +1164,8 @@ for c in pron_cols:
         mov_pron[c] = ""
 
 mov_pron_out = mov_pron[pron_cols].copy()
-
-styled_pron = (
-    mov_pron_out.style
-    .applymap(color_saldo, subset=["SALDO"])
-    .applymap(style_estado, subset=["COBRADO/PAGADO"])
-    .format({"COBROS": eur, "PAGOS": eur, "SALDO": eur})
-)
-st.dataframe(styled_pron, use_container_width=True)
+mov_pron_show = format_currency_columns(mov_pron_out, ["COBROS", "PAGOS", "SALDO"])
+st.dataframe(mov_pron_show, use_container_width=True)
 
 # -----------------------------
 # Movimientos — REAL
@@ -1200,14 +1183,8 @@ for c in real_cols:
         mov_real[c] = ""
 
 mov_real_out = mov_real[real_cols].copy()
-
-styled_real = (
-    mov_real_out.style
-    .applymap(color_saldo, subset=["SALDO"])
-    .applymap(style_estado, subset=["COBRADO/PAGADO"])
-    .format({"COBROS": eur, "PAGOS": eur, "SALDO": eur})
-)
-st.dataframe(styled_real, use_container_width=True)
+mov_real_show = format_currency_columns(mov_real_out, ["COBROS", "PAGOS", "SALDO"])
+st.dataframe(mov_real_show, use_container_width=True)
 
 # -----------------------------
 # Resumen mensual
@@ -1244,8 +1221,8 @@ monthly_real = resumen_mensual(consolidado_real2, d_from, d_to)
 
 def show_monthly_table(df: pd.DataFrame, titulo: str):
     st.markdown(f"#### {titulo}")
-    styled = df.style.format({c: eur for c in df.columns if c != "MES"})
-    st.dataframe(styled, use_container_width=True)
+    df_show = format_currency_columns(df, [c for c in df.columns if c != "MES"])
+    st.dataframe(df_show, use_container_width=True)
 
 
 if modo_resumen == "REAL":
