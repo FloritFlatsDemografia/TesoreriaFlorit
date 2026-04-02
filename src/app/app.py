@@ -1267,7 +1267,7 @@ chart = (
 )
 
 st.altair_chart(chart, use_container_width=True)
-st.caption("La línea roja gruesa representa la cobertura total: saldo neto actual + pólizas disponibles.")
+st.caption("La línea roja gruesa representa el límite de endeudamiento disponible en pólizas.")
 
 # -----------------------------
 # Movimientos — PRON
