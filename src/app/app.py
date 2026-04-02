@@ -338,7 +338,8 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     else:
         df["FECHA_PAGO"] = pd.NaT
 
-    df["PAGADO_BOOL"] = df["PAGADO"].apply(is_pagado)
+    # Ejecutado si está marcado como pagado/cobrado o si ya tiene fecha de ejecución
+    df["PAGADO_BOOL"] = df["PAGADO"].apply(is_pagado) | df["FECHA_PAGO"].notna()
 
     if "IMPORTE PRONOSTICADO" not in df.columns:
         raise ValueError("Falta columna: 'IMPORTE PRONOSTICADO' o su alias 'PREVISION'")
@@ -865,9 +866,23 @@ base_filtered_real = generated_real[
     generated_real["TIPO"].isin(sel_tipos)
 ].copy().sort_values("FECHA").reset_index(drop=True) if not generated_real.empty else generated_real.copy()
 
-pron_df = base_filtered_pron[~base_filtered_pron["PAGADO_BOOL"]].copy().sort_values("FECHA").reset_index(drop=True)
+# -----------------------------
+# NUEVA LÓGICA TESORERÍA
+# -----------------------------
 
-real_df = base_filtered_real.copy()
+# Pronosticado fijo: incluye TODO el forecast, aunque luego se ejecute
+pron_df = base_filtered_pron.copy().sort_values("FECHA").reset_index(drop=True)
+
+# PRON pendientes: solo lo pendiente
+pron_pendientes_df = base_filtered_pron[
+    ~base_filtered_pron["PAGADO_BOOL"]
+].copy().sort_values("FECHA").reset_index(drop=True)
+
+# REAL ejecutado: solo lo ya cobrado/pagado
+real_df = base_filtered_real[
+    base_filtered_real["PAGADO_BOOL"]
+].copy().sort_values("FECHA").reset_index(drop=True)
+
 real_df["FECHA"] = pd.to_datetime(real_df["FECHA"], errors="coerce").dt.normalize()
 real_df["ESTATUS"] = real_df.apply(
     lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
@@ -876,10 +891,17 @@ real_df["ESTATUS"] = real_df.apply(
 real_df = real_df.sort_values("FECHA").reset_index(drop=True)
 
 consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON") if not pron_df.empty else pron_df.copy()
+consolidado_pron_pend = compute_balance_from_amount(pron_pendientes_df, saldo_hoy, "IMPORTE_PRON") if not pron_pendientes_df.empty else pron_pendientes_df.copy()
 consolidado_real = compute_balance_from_amount(real_df, saldo_hoy, "IMPORTE_REAL") if not real_df.empty else real_df.copy()
 
 if not consolidado_pron.empty:
     consolidado_pron["ESTATUS"] = consolidado_pron.apply(
+        lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
+        axis=1
+    )
+
+if not consolidado_pron_pend.empty:
+    consolidado_pron_pend["ESTATUS"] = consolidado_pron_pend.apply(
         lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
         axis=1
     )
@@ -911,9 +933,11 @@ base_row = pd.DataFrame([{
 }])
 
 consolidado_pron2 = pd.concat([base_row, consolidado_pron], ignore_index=True) if not consolidado_pron.empty else base_row.copy()
+consolidado_pron_pend2 = pd.concat([base_row, consolidado_pron_pend], ignore_index=True) if not consolidado_pron_pend.empty else base_row.copy()
 consolidado_real2 = pd.concat([base_row, consolidado_real], ignore_index=True) if not consolidado_real.empty else base_row.copy()
 
 consolidado_pron2 = coalesce_cliente_empresa(consolidado_pron2)
+consolidado_pron_pend2 = coalesce_cliente_empresa(consolidado_pron_pend2)
 consolidado_real2 = coalesce_cliente_empresa(consolidado_real2)
 
 # -----------------------------
@@ -969,14 +993,16 @@ def apply_visual_filters(df: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values("FECHA").reset_index(drop=True)
 
 
-view_pron = apply_visual_filters(consolidado_pron2)
+view_pron = apply_visual_filters(consolidado_pron_pend2)
 view_real = apply_visual_filters(consolidado_real2)
+view_real = view_real[view_real["ESTATUS"].isin(["PAGADO", "COBRADO"])].copy()
 
 # -----------------------------
 # KPIs claros a fecha objetivo
 # -----------------------------
 fecha_objetivo = pd.Timestamp(d_to).normalize()
 
+# El previsto usa el forecast fijo completo
 saldo_pron_obj = get_saldo_en_fecha(consolidado_pron2, fecha_objetivo, saldo_hoy)
 saldo_real_obj = get_saldo_en_fecha(consolidado_real2, fecha_objetivo, saldo_hoy)
 
@@ -986,8 +1012,8 @@ gap_pct = safe_deviation_pct(saldo_real_obj, saldo_pron_obj)
 pagos_pendientes_hasta = 0.0
 cobros_pendientes_hasta = 0.0
 
-if not pron_df.empty:
-    pron_hasta_obj = pron_df[pron_df["FECHA"] <= fecha_objetivo].copy()
+if not pron_pendientes_df.empty:
+    pron_hasta_obj = pron_pendientes_df[pron_pendientes_df["FECHA"] <= fecha_objetivo].copy()
     if not pron_hasta_obj.empty:
         pron_hasta_obj = compute_balance_from_amount(pron_hasta_obj, saldo_hoy, "IMPORTE_PRON")
         pagos_pendientes_hasta = float(pron_hasta_obj["PAGOS"].sum())
@@ -1093,7 +1119,7 @@ daily_zoom = daily[(daily["FECHA"] >= zoom_start) & (daily["FECHA"] <= zoom_end)
 
 value_vars = ["SALDO_PRON", "SALDO_REAL"]
 series_map = {
-    "SALDO_PRON": "Pronosticado (pendiente)",
+    "SALDO_PRON": "Pronosticado",
     "SALDO_REAL": "Real (estimado/ejecutado)",
 }
 
@@ -1113,7 +1139,7 @@ plot_df = daily_zoom.melt(
 plot_df["SERIE"] = plot_df["SERIE"].map(series_map)
 
 domain = [
-    "Pronosticado (pendiente)",
+    "Pronosticado",
     "Real (estimado/ejecutado)",
     "Cuenta efectivo",
     "Cuenta suplidos",
@@ -1137,7 +1163,7 @@ area_pos = (
         tooltip=[
             alt.Tooltip("FECHA:T", title="Fecha"),
             alt.Tooltip("SALDO_REAL:Q", title="Saldo real", format=",.2f"),
-            alt.Tooltip("SALDO_PRON:Q", title="Saldo pron", format=",.2f"),
+            alt.Tooltip("SALDO_PRON:Q", title="Saldo pronosticado", format=",.2f"),
             alt.Tooltip("DESVIACION:Q", title="Desviación", format=",.2f"),
         ],
     )
@@ -1153,7 +1179,7 @@ area_neg = (
         tooltip=[
             alt.Tooltip("FECHA:T", title="Fecha"),
             alt.Tooltip("SALDO_REAL:Q", title="Saldo real", format=",.2f"),
-            alt.Tooltip("SALDO_PRON:Q", title="Saldo pron", format=",.2f"),
+            alt.Tooltip("SALDO_PRON:Q", title="Saldo pronosticado", format=",.2f"),
             alt.Tooltip("DESVIACION:Q", title="Desviación", format=",.2f"),
         ],
     )
@@ -1189,7 +1215,7 @@ st.caption("El rango de fechas del lateral actúa como filtro base. El gap se ca
 # -----------------------------
 st.subheader("Movimientos (formato tesorería) — PRON (pendientes)")
 
-mov_pron = view_pron.copy()
+mov_pron = view_pron[view_pron["ESTATUS"] == "PENDIENTE"].copy()
 mov_pron = coalesce_cliente_empresa(mov_pron)
 mov_pron["VTO. PAGO"] = mov_pron["FECHA"].dt.strftime("%d-%m-%y")
 mov_pron["COBRADO/PAGADO"] = mov_pron["ESTATUS"]
@@ -1265,7 +1291,8 @@ def resumen_mensual(df_base: pd.DataFrame, d_from: date, d_to: date) -> pd.DataF
     return monthly_visible.merge(monthly_close, on="MES", how="left")
 
 
-monthly_pron = resumen_mensual(consolidado_pron2, d_from, d_to)
+# PRON mensual usa pendientes, no el baseline fijo
+monthly_pron = resumen_mensual(consolidado_pron_pend2, d_from, d_to)
 monthly_real = resumen_mensual(consolidado_real2, d_from, d_to)
 
 
