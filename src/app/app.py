@@ -327,7 +327,7 @@ def read_bancos_from_excel(uploaded_file) -> dict:
         raise ValueError("No puedo leer 'TOTAL DISPONIBLE' en la hoja BANCOS.")
 
     saldo_inicial = float(total_ctas) - float(total_dispuesto)
-    capacidad_total_cobertura = float(total_disponible)
+    capacidad_total_cobertura = -float(total_disponible)
 
     return {
         "saldo_inicial": saldo_inicial,
@@ -837,7 +837,7 @@ st.sidebar.metric("TOTAL CTAS", eur(total_ctas))
 st.sidebar.metric("TOTAL DISPUESTO", eur(total_dispuesto))
 st.sidebar.metric("TOTAL PÓLIZAS", eur(total_polizas))
 st.sidebar.metric("TOTAL DISPONIBLE", eur(total_disponible))
-st.sidebar.metric("TOTAL DISPONIBLE PÓLIZAS", eur(capacidad_total_cobertura))
+st.sidebar.metric("Límite endeudamiento pólizas", eur(capacidad_total_cobertura))
 
 if cuenta_suplidos is not None:
     st.sidebar.metric("CUENTA SUPLIDOS", eur(cuenta_suplidos))
