@@ -254,49 +254,90 @@ def format_currency_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 
 # -----------------------------
-# Leer hoja BANCOS
+# Leer hoja BANCOS (NUEVA ESTRUCTURA)
 # -----------------------------
 def read_bancos_from_excel(uploaded_file) -> dict:
     uploaded_file.seek(0)
     wb = openpyxl.load_workbook(uploaded_file, data_only=True)
+
     sheet_name = None
     for name in wb.sheetnames:
         if str(name).strip().upper() == "BANCOS":
             sheet_name = name
             break
+
     if sheet_name is None:
         raise ValueError("No encuentro la hoja 'BANCOS' en el Excel.")
 
     ws = wb[sheet_name]
 
-    mapping = {}
-    for r in range(1, ws.max_row + 1):
-        k = ws.cell(r, 1).value
-        v = ws.cell(r, 2).value
-        if k is None:
-            continue
-        mapping[str(k).strip().upper()] = v
+    def norm(v):
+        return normalize_colname(v) if v is not None else ""
 
-    def get_num(key: str):
-        v = mapping.get(key)
-        if v is None:
+    def to_num(v):
+        if v is None or v == "":
             return None
         try:
             return float(v)
         except Exception:
-            return None
+            try:
+                s = str(v).replace("€", "").replace(".", "").replace(",", ".").strip()
+                return float(s)
+            except Exception:
+                return None
 
-    total_bancos = get_num("TOTAL BANCOS")
-    suplidos = get_num("CUENTA SUPLIDOS")
-    efectivo = get_num("CUENTA DE EFECTIVO")
+    total_ctas = None
+    total_dispuesto = None
+    total_polizas = None
+    total_disponible = None
+    cuenta_suplidos = None
+    cuenta_efectivo = None
 
-    if total_bancos is None:
-        raise ValueError("En hoja BANCOS no puedo leer un número en 'TOTAL BANCOS' (columna €).")
+    for r in range(1, ws.max_row + 1):
+        a = norm(ws.cell(r, 1).value)
+        b = ws.cell(r, 2).value
+        d = norm(ws.cell(r, 4).value)
+        e = ws.cell(r, 5).value
+
+        if a == "TOTAL CTAS":
+            total_ctas = to_num(b)
+
+        if d == "TOTAL DISPUESTO":
+            total_dispuesto = to_num(e)
+
+        if a == "TOTAL POLIZAS":
+            total_polizas = to_num(b)
+
+        if d == "TOTAL DISPONIBLE":
+            total_disponible = to_num(e)
+
+        if a == "CUENTA SUPLIDOS":
+            cuenta_suplidos = to_num(b)
+
+        if a == "CUENTA DE EFECTIVO":
+            cuenta_efectivo = to_num(b)
+
+    if total_ctas is None:
+        raise ValueError("No puedo leer 'TOTAL CTAS' en la hoja BANCOS.")
+    if total_dispuesto is None:
+        raise ValueError("No puedo leer 'TOTAL DISPUESTO' en la hoja BANCOS.")
+    if total_polizas is None:
+        raise ValueError("No puedo leer 'TOTAL POLIZAS' en la hoja BANCOS.")
+    if total_disponible is None:
+        raise ValueError("No puedo leer 'TOTAL DISPONIBLE' en la hoja BANCOS.")
+
+    saldo_inicial = float(total_ctas) - float(total_dispuesto)
+    capacidad_total_cobertura = saldo_inicial + float(total_disponible)
 
     return {
-        "total_bancos": total_bancos,
-        "cuenta_suplidos": suplidos,
-        "cuenta_efectivo": efectivo
+        "saldo_inicial": saldo_inicial,
+        "total_ctas": float(total_ctas),
+        "total_dispuesto": float(total_dispuesto),
+        "total_polizas": float(total_polizas),
+        "total_disponible": float(total_disponible),
+        "capacidad_total_cobertura": float(capacidad_total_cobertura),
+        "cuenta_suplidos": cuenta_suplidos,
+        "cuenta_efectivo": cuenta_efectivo,
     }
 
 
@@ -338,7 +379,7 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     else:
         df["FECHA_PAGO"] = pd.NaT
 
-    # Ejecutado si está marcado como pagado/cobrado o si ya tiene fecha de ejecución
+    # Ejecutado si está marcado o si ya tiene fecha
     df["PAGADO_BOOL"] = df["PAGADO"].apply(is_pagado) | df["FECHA_PAGO"].notna()
 
     if "IMPORTE PRONOSTICADO" not in df.columns:
@@ -780,12 +821,24 @@ except Exception as e:
     st.error(f"Error leyendo hoja BANCOS: {e}")
     st.stop()
 
-saldo_hoy = float(bancos["total_bancos"])
+saldo_hoy = float(bancos["saldo_inicial"])
+total_ctas = float(bancos["total_ctas"])
+total_dispuesto = float(bancos["total_dispuesto"])
+total_polizas = float(bancos["total_polizas"])
+total_disponible = float(bancos["total_disponible"])
+capacidad_total_cobertura = float(bancos["capacidad_total_cobertura"])
+
 cuenta_suplidos = bancos.get("cuenta_suplidos", None)
 cuenta_efectivo = bancos.get("cuenta_efectivo", None)
 
 st.sidebar.header("Bancos (desde Excel)")
-st.sidebar.metric("TOTAL BANCOS (saldo inicial)", eur(saldo_hoy))
+st.sidebar.metric("Saldo inicial neto", eur(saldo_hoy))
+st.sidebar.metric("TOTAL CTAS", eur(total_ctas))
+st.sidebar.metric("TOTAL DISPUESTO", eur(total_dispuesto))
+st.sidebar.metric("TOTAL PÓLIZAS", eur(total_polizas))
+st.sidebar.metric("TOTAL DISPONIBLE", eur(total_disponible))
+st.sidebar.metric("Cobertura total (saldo + pólizas)", eur(capacidad_total_cobertura))
+
 if cuenta_suplidos is not None:
     st.sidebar.metric("CUENTA SUPLIDOS", eur(cuenta_suplidos))
 if cuenta_efectivo is not None:
@@ -867,18 +920,17 @@ base_filtered_real = generated_real[
 ].copy().sort_values("FECHA").reset_index(drop=True) if not generated_real.empty else generated_real.copy()
 
 # -----------------------------
-# NUEVA LÓGICA TESORERÍA
+# Lógica tesorería
 # -----------------------------
-
-# Pronosticado fijo: incluye TODO el forecast, aunque luego se ejecute
+# Pronosticado fijo
 pron_df = base_filtered_pron.copy().sort_values("FECHA").reset_index(drop=True)
 
-# PRON pendientes: solo lo pendiente
+# Pendientes
 pron_pendientes_df = base_filtered_pron[
     ~base_filtered_pron["PAGADO_BOOL"]
 ].copy().sort_values("FECHA").reset_index(drop=True)
 
-# REAL ejecutado: solo lo ya cobrado/pagado
+# Ejecutados
 real_df = base_filtered_real[
     base_filtered_real["PAGADO_BOOL"]
 ].copy().sort_values("FECHA").reset_index(drop=True)
@@ -998,11 +1050,10 @@ view_real = apply_visual_filters(consolidado_real2)
 view_real = view_real[view_real["ESTATUS"].isin(["PAGADO", "COBRADO"])].copy()
 
 # -----------------------------
-# KPIs claros a fecha objetivo
+# KPIs
 # -----------------------------
 fecha_objetivo = pd.Timestamp(d_to).normalize()
 
-# El previsto usa el forecast fijo completo
 saldo_pron_obj = get_saldo_en_fecha(consolidado_pron2, fecha_objetivo, saldo_hoy)
 saldo_real_obj = get_saldo_en_fecha(consolidado_real2, fecha_objetivo, saldo_hoy)
 
@@ -1034,15 +1085,7 @@ with c4:
 with c5:
     st.metric("Gap %", pct(gap_pct))
 with c6:
-    if not gastos_alerta.empty:
-        g = gastos_alerta.iloc[0]
-        st.metric(
-            "Próximo gasto relevante",
-            eur(g["PAGOS"]),
-            delta=f'{str(g["CONCEPTO"])[:18]} · {int(g["DIAS"])} días'
-        )
-    else:
-        st.metric("Próximo gasto relevante", "—")
+    st.metric("Cobertura total", eur(capacidad_total_cobertura))
 
 c7, c8 = st.columns(2)
 with c7:
@@ -1112,6 +1155,9 @@ if cuenta_suplidos is not None:
     daily["LINEA_SUPLIDOS"] = float(cuenta_suplidos)
 if cuenta_efectivo is not None:
     daily["LINEA_EFECTIVO"] = float(cuenta_efectivo)
+
+# Línea roja gruesa: saldo neto + pólizas disponibles
+daily["LINEA_COBERTURA_TOTAL"] = float(capacidad_total_cobertura)
 
 zoom_start = pd.Timestamp(d_from)
 zoom_end = pd.Timestamp(d_to)
@@ -1200,15 +1246,28 @@ lines = (
     )
 )
 
+linea_cobertura = (
+    alt.Chart(daily_zoom)
+    .mark_line(color="red", strokeWidth=4)
+    .encode(
+        x=alt.X("FECHA:T", title="Fecha"),
+        y=alt.Y("LINEA_COBERTURA_TOTAL:Q", title="Saldo"),
+        tooltip=[
+            alt.Tooltip("FECHA:T", title="Fecha"),
+            alt.Tooltip("LINEA_COBERTURA_TOTAL:Q", title="Cobertura total", format=",.2f"),
+        ],
+    )
+)
+
 chart = (
-    alt.layer(area_pos, area_neg, lines)
+    alt.layer(area_pos, area_neg, lines, linea_cobertura)
     .add_params(chart_interval)
     .interactive()
     .properties(height=420)
 )
 
 st.altair_chart(chart, use_container_width=True)
-st.caption("El rango de fechas del lateral actúa como filtro base. El gap se calcula sobre la fecha final exacta del rango seleccionado.")
+st.caption("La línea roja gruesa representa la cobertura total: saldo neto actual + pólizas disponibles.")
 
 # -----------------------------
 # Movimientos — PRON
@@ -1291,7 +1350,6 @@ def resumen_mensual(df_base: pd.DataFrame, d_from: date, d_to: date) -> pd.DataF
     return monthly_visible.merge(monthly_close, on="MES", how="left")
 
 
-# PRON mensual usa pendientes, no el baseline fijo
 monthly_pron = resumen_mensual(consolidado_pron_pend2, d_from, d_to)
 monthly_real = resumen_mensual(consolidado_real2, d_from, d_to)
 
