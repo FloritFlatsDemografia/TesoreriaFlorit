@@ -1325,7 +1325,7 @@ chart = (
 )
 
 st.altair_chart(chart, use_container_width=True)
-st.caption("La línea roja gruesa representa el total de pólizas.")
+alt.Tooltip("LINEA_TOTAL_POLIZAS:Q", title="Total pólizas", format=",.2f")
 
 # -----------------------------
 # Facturas pendientes proveedor
