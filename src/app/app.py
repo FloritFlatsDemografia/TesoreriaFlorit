@@ -331,14 +331,6 @@ def get_facturas_pendientes_proveedor(
     return tmp
 
 
-def format_currency_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    out = df.copy()
-    for c in cols:
-        if c in out.columns:
-            out[c] = pd.to_numeric(get_first_series(out, c), errors="coerce").map(eur)
-    return out
-
-
 # -----------------------------
 # Leer hoja BANCOS
 # -----------------------------
@@ -376,6 +368,8 @@ def read_bancos_from_excel(uploaded_file) -> dict:
     total_dispuesto = None
     total_polizas = None
     total_disponible = None
+    cuenta_suplidos = None
+    cuenta_efectivo = None
 
     for r in range(1, ws.max_row + 1):
         a = norm(ws.cell(r, 1).value)
@@ -391,6 +385,10 @@ def read_bancos_from_excel(uploaded_file) -> dict:
             total_polizas = to_num(b)
         if d == "TOTAL DISPONIBLE":
             total_disponible = to_num(e)
+        if a == "CUENTA SUPLIDOS":
+            cuenta_suplidos = to_num(b)
+        if a == "CUENTA DE EFECTIVO":
+            cuenta_efectivo = to_num(b)
 
     if total_ctas is None:
         raise ValueError("No puedo leer 'TOTAL CTAS' en la hoja BANCOS.")
@@ -411,6 +409,8 @@ def read_bancos_from_excel(uploaded_file) -> dict:
         "total_polizas": float(total_polizas),
         "total_disponible": float(total_disponible),
         "capacidad_total_cobertura": float(capacidad_total_cobertura),
+        "cuenta_suplidos": cuenta_suplidos,
+        "cuenta_efectivo": cuenta_efectivo,
     }
 
 
@@ -903,6 +903,8 @@ total_dispuesto = float(bancos["total_dispuesto"])
 total_polizas = float(bancos["total_polizas"])
 total_disponible = float(bancos["total_disponible"])
 capacidad_total_cobertura = float(bancos["capacidad_total_cobertura"])
+cuenta_suplidos = bancos.get("cuenta_suplidos")
+cuenta_efectivo = bancos.get("cuenta_efectivo")
 
 st.sidebar.header("Bancos (desde Excel)")
 st.sidebar.metric("Saldo inicial neto", eur(saldo_hoy))
@@ -911,6 +913,11 @@ st.sidebar.metric("TOTAL DISPUESTO", eur(total_dispuesto))
 st.sidebar.metric("TOTAL PÓLIZAS", eur(total_polizas))
 st.sidebar.metric("TOTAL DISPONIBLE", eur(total_disponible))
 st.sidebar.metric("Límite endeudamiento pólizas", eur(capacidad_total_cobertura))
+
+if cuenta_efectivo is not None:
+    st.sidebar.metric("CUENTA DE EFECTIVO", eur(cuenta_efectivo))
+if cuenta_suplidos is not None:
+    st.sidebar.metric("CUENTA SUPLIDOS", eur(cuenta_suplidos))
 
 try:
     catalog = read_catalog_from_excel(uploaded)
@@ -1312,20 +1319,32 @@ linea_polizas = (
         y=alt.Y("LINEA_TOTAL_POLIZAS:Q", title="Saldo"),
         tooltip=[
             alt.Tooltip("FECHA:T", title="Fecha"),
-            alt.Tooltip("LINEA_TOTAL_POLIZAS:Q", title="Total pólizas", format=",.2f"),
+            alt.Tooltip("LINEA_TOTAL_POLIZAS:Q", title="Total pólizas (-)", format=",.2f"),
         ],
     )
 )
 
+today_ts = pd.Timestamp(date.today()).normalize()
+today_rule_df = pd.DataFrame({"FECHA": [today_ts]})
+
+linea_hoy = (
+    alt.Chart(today_rule_df)
+    .mark_rule(color="#9E9E9E", strokeWidth=1)
+    .encode(
+        x=alt.X("FECHA:T"),
+        tooltip=[alt.Tooltip("FECHA:T", title="Hoy")]
+    )
+)
+
 chart = (
-    alt.layer(area_pos, area_neg, lines, linea_polizas)
+    alt.layer(area_pos, area_neg, lines, linea_polizas, linea_hoy)
     .add_params(chart_interval)
     .interactive()
     .properties(height=420)
 )
 
 st.altair_chart(chart, use_container_width=True)
-alt.Tooltip("LINEA_TOTAL_POLIZAS:Q", title="Total pólizas", format=",.2f")
+st.caption("La línea roja gruesa representa el total de pólizas en negativo. La línea gris vertical marca el día de hoy.")
 
 # -----------------------------
 # Facturas pendientes proveedor
@@ -1344,32 +1363,12 @@ if facturas_pendientes.empty:
 else:
     total_facturas_rango = float(facturas_pendientes["IMPORTE_FACTURA"].sum())
 
-    proveedor_resumen = (
-        facturas_pendientes
-        .groupby("Proveedor", as_index=False)
-        .agg(
-            Facturas=("CONCEPTO", "count"),
-            Total=("IMPORTE_FACTURA", "sum")
-        )
-        .sort_values("Total", ascending=False)
-    )
-
-    cfp1, cfp2 = st.columns(2)
-    with cfp1:
-        st.metric(
-            f"Total pendiente en rango ({pd.Timestamp(d_from).strftime('%d-%m-%Y')} a {pd.Timestamp(d_to).strftime('%d-%m-%Y')})",
-            eur(total_facturas_rango)
-        )
-    with cfp2:
-        st.metric("Número de facturas pendientes", int(len(facturas_pendientes)))
-
-    st.markdown("#### Resumen por proveedor")
-    st.dataframe(
-        proveedor_resumen.style.format({"Total": eur}),
-        use_container_width=True
-    )
-
     st.markdown("#### Desglose de facturas pendientes")
+    st.metric(
+        f"Total pendiente en rango ({pd.Timestamp(d_from).strftime('%d-%m-%Y')} a {pd.Timestamp(d_to).strftime('%d-%m-%Y')})",
+        eur(total_facturas_rango)
+    )
+
     facturas_out = facturas_pendientes[[
         "FECHA", "Proveedor", "CONCEPTO", "DEPARTAMENTO", "IMPORTE_FACTURA",
         "Dias hasta vencimiento"
