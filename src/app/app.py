@@ -1232,7 +1232,7 @@ daily["AREA_NEG_BOTTOM"] = daily["AREA_POS_BOTTOM"]
 daily.loc[daily["DESVIACION"] < 0, ["AREA_POS_TOP", "AREA_POS_BOTTOM"]] = pd.NA
 daily.loc[daily["DESVIACION"] >= 0, ["AREA_NEG_TOP", "AREA_NEG_BOTTOM"]] = pd.NA
 
-daily["LINEA_TOTAL_POLIZAS"] = float(total_polizas)
+daily["LINEA_TOTAL_POLIZAS"] = -float(total_polizas)
 
 zoom_start = pd.Timestamp(d_from)
 zoom_end = pd.Timestamp(d_to)
