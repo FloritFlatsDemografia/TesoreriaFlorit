@@ -226,21 +226,31 @@ def get_gastos_relevantes(
 
     tmp = df.copy()
     tmp["FECHA"] = pd.to_datetime(tmp["FECHA"], errors="coerce").dt.normalize()
+    tmp["TIPO"] = tmp["TIPO"].astype(str).str.upper().str.strip()
 
-    if "PAGOS" not in tmp.columns:
-        tmp["PAGOS"] = 0.0
+    if "PAGADO_BOOL" in tmp.columns:
+        tmp = tmp[~tmp["PAGADO_BOOL"].fillna(False)].copy()
 
-    tmp["PAGOS"] = pd.to_numeric(tmp["PAGOS"], errors="coerce").fillna(0.0)
+    if "PAGOS" in tmp.columns:
+        tmp["IMPORTE_ALERTA"] = pd.to_numeric(tmp["PAGOS"], errors="coerce")
+    elif "IMPORTE_PRON" in tmp.columns:
+        tmp["IMPORTE_ALERTA"] = pd.to_numeric(tmp["IMPORTE_PRON"], errors="coerce")
+    elif "IMPORTE_REAL" in tmp.columns:
+        tmp["IMPORTE_ALERTA"] = pd.to_numeric(tmp["IMPORTE_REAL"], errors="coerce")
+    else:
+        tmp["IMPORTE_ALERTA"] = 0.0
+
+    tmp["IMPORTE_ALERTA"] = tmp["IMPORTE_ALERTA"].fillna(0.0)
 
     tmp = tmp[
-        (tmp["TIPO"].astype(str).str.upper() == "GASTO") &
+        (tmp["TIPO"] == "GASTO") &
         (tmp["FECHA"] >= fecha_base) &
         (tmp["FECHA"] <= fecha_base + pd.Timedelta(days=dias)) &
-        (tmp["PAGOS"] >= umbral)
+        (tmp["IMPORTE_ALERTA"] >= umbral)
     ].copy()
 
     tmp["DIAS"] = (tmp["FECHA"] - fecha_base).dt.days
-    tmp = tmp.sort_values(["FECHA", "PAGOS"], ascending=[True, False])
+    tmp = tmp.sort_values(["FECHA", "IMPORTE_ALERTA"], ascending=[True, False])
 
     return tmp
 
@@ -922,15 +932,12 @@ base_filtered_real = generated_real[
 # -----------------------------
 # Lógica tesorería
 # -----------------------------
-# Pronosticado fijo
 pron_df = base_filtered_pron.copy().sort_values("FECHA").reset_index(drop=True)
 
-# Pendientes
 pron_pendientes_df = base_filtered_pron[
     ~base_filtered_pron["PAGADO_BOOL"]
 ].copy().sort_values("FECHA").reset_index(drop=True)
 
-# Ejecutados
 real_df = base_filtered_real[
     base_filtered_real["PAGADO_BOOL"]
 ].copy().sort_values("FECHA").reset_index(drop=True)
@@ -1070,7 +1077,8 @@ if not pron_pendientes_df.empty:
         pagos_pendientes_hasta = float(pron_hasta_obj["PAGOS"].sum())
         cobros_pendientes_hasta = float(pron_hasta_obj["COBROS"].sum())
 
-gastos_alerta = get_gastos_relevantes(view_pron, start_ts, dias=30, umbral=3000.0)
+# ALERTAS: usar dataset de pendientes real de previsión, no el visual filtrado
+gastos_alerta = get_gastos_relevantes(pron_pendientes_df, start_ts, dias=30, umbral=3000.0)
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 
@@ -1101,13 +1109,13 @@ st.subheader("Alertas de gastos elevados")
 if gastos_alerta.empty:
     st.info("No hay gastos elevados en los próximos 30 días con el umbral actual (3.000 €).")
 else:
-    alertas_out = gastos_alerta[["FECHA", "CONCEPTO", "CLIENTE", "PAGOS", "DIAS"]].copy()
+    alertas_out = gastos_alerta[["FECHA", "CONCEPTO", "CLIENTE", "IMPORTE_ALERTA", "DIAS"]].copy()
     alertas_out["FECHA"] = pd.to_datetime(alertas_out["FECHA"]).dt.strftime("%d-%m-%Y")
     alertas_out = alertas_out.rename(columns={
         "FECHA": "Fecha",
         "CONCEPTO": "Concepto",
         "CLIENTE": "Cliente / Proveedor",
-        "PAGOS": "Importe",
+        "IMPORTE_ALERTA": "Importe",
         "DIAS": "En"
     })
 
@@ -1151,13 +1159,8 @@ daily["AREA_NEG_BOTTOM"] = daily["AREA_POS_BOTTOM"]
 daily.loc[daily["DESVIACION"] < 0, ["AREA_POS_TOP", "AREA_POS_BOTTOM"]] = pd.NA
 daily.loc[daily["DESVIACION"] >= 0, ["AREA_NEG_TOP", "AREA_NEG_BOTTOM"]] = pd.NA
 
-if cuenta_suplidos is not None:
-    daily["LINEA_SUPLIDOS"] = float(cuenta_suplidos)
-if cuenta_efectivo is not None:
-    daily["LINEA_EFECTIVO"] = float(cuenta_efectivo)
-
-# Línea roja gruesa: saldo neto + pólizas disponibles
-daily["LINEA_COBERTURA_TOTAL"] = float(capacidad_total_cobertura)
+# Línea roja gruesa: TOTAL PÓLIZAS
+daily["LINEA_TOTAL_POLIZAS"] = float(total_polizas)
 
 zoom_start = pd.Timestamp(d_from)
 zoom_end = pd.Timestamp(d_to)
@@ -1168,13 +1171,6 @@ series_map = {
     "SALDO_PRON": "Pronosticado",
     "SALDO_REAL": "Real (estimado/ejecutado)",
 }
-
-if "LINEA_EFECTIVO" in daily_zoom.columns:
-    value_vars.append("LINEA_EFECTIVO")
-    series_map["LINEA_EFECTIVO"] = "Cuenta efectivo"
-if "LINEA_SUPLIDOS" in daily_zoom.columns:
-    value_vars.append("LINEA_SUPLIDOS")
-    series_map["LINEA_SUPLIDOS"] = "Cuenta suplidos"
 
 plot_df = daily_zoom.melt(
     id_vars=["FECHA"],
@@ -1187,14 +1183,10 @@ plot_df["SERIE"] = plot_df["SERIE"].map(series_map)
 domain = [
     "Pronosticado",
     "Real (estimado/ejecutado)",
-    "Cuenta efectivo",
-    "Cuenta suplidos",
 ]
 range_ = [
     "#6BAED6",
     "#08519C",
-    "#FF7F0E",
-    "#8A2BE2",
 ]
 
 chart_interval = alt.selection_interval(bind="scales")
@@ -1246,28 +1238,28 @@ lines = (
     )
 )
 
-linea_cobertura = (
+linea_polizas = (
     alt.Chart(daily_zoom)
     .mark_line(color="red", strokeWidth=4)
     .encode(
         x=alt.X("FECHA:T", title="Fecha"),
-        y=alt.Y("LINEA_COBERTURA_TOTAL:Q", title="Saldo"),
+        y=alt.Y("LINEA_TOTAL_POLIZAS:Q", title="Saldo"),
         tooltip=[
             alt.Tooltip("FECHA:T", title="Fecha"),
-            alt.Tooltip("LINEA_COBERTURA_TOTAL:Q", title="Cobertura total", format=",.2f"),
+            alt.Tooltip("LINEA_TOTAL_POLIZAS:Q", title="Total pólizas", format=",.2f"),
         ],
     )
 )
 
 chart = (
-    alt.layer(area_pos, area_neg, lines, linea_cobertura)
+    alt.layer(area_pos, area_neg, lines, linea_polizas)
     .add_params(chart_interval)
     .interactive()
     .properties(height=420)
 )
 
 st.altair_chart(chart, use_container_width=True)
-st.caption("La línea roja gruesa representa el límite de endeudamiento disponible en pólizas.")
+st.caption("La línea roja gruesa representa el total de pólizas.")
 
 # -----------------------------
 # Movimientos — PRON
