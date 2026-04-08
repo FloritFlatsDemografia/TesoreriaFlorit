@@ -66,7 +66,29 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 def drop_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    return df.loc[:, ~df.columns.duplicated()]
+    if not df.columns.is_unique:
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
+    return df
+
+
+def get_first_series(df: pd.DataFrame, colname: str, default="") -> pd.Series:
+    """
+    Devuelve SIEMPRE una Series aunque existan columnas duplicadas.
+    Si no existe la columna, devuelve una Series con el valor por defecto.
+    """
+    if colname not in df.columns:
+        return pd.Series([default] * len(df), index=df.index, dtype="object")
+
+    selected = df.loc[:, df.columns == colname]
+
+    if isinstance(selected, pd.DataFrame):
+        if selected.shape[1] == 0:
+            return pd.Series([default] * len(df), index=df.index, dtype="object")
+        s = selected.iloc[:, 0]
+    else:
+        s = selected
+
+    return s.reindex(df.index)
 
 
 def apply_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
@@ -98,6 +120,7 @@ def apply_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
     if rename_dict:
         df = df.rename(columns=rename_dict)
 
+    df = drop_duplicate_columns(df)
     return df
 
 
@@ -190,34 +213,44 @@ def safe_deviation_pct(real_value: float, pron_value: float) -> float:
 
 
 def coalesce_cliente_empresa(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robusta frente a columnas duplicadas.
+    """
     df = df.copy()
 
-    if "CLIENTE" not in df.columns:
-        df["CLIENTE"] = ""
-    if "EMPRESA" not in df.columns:
-        df["EMPRESA"] = ""
+    cliente = get_first_series(df, "CLIENTE", default="")
+    empresa = get_first_series(df, "EMPRESA", default="")
 
-    cliente = df["CLIENTE"].where(pd.notna(df["CLIENTE"]), "").astype(str).str.strip()
-    empresa = df["EMPRESA"].where(pd.notna(df["EMPRESA"]), "").astype(str).str.strip()
+    cliente = cliente.where(pd.notna(cliente), "").astype(str).str.strip()
+    empresa = empresa.where(pd.notna(empresa), "").astype(str).str.strip()
 
     cliente = cliente.replace({"nan": "", "None": ""})
     empresa = empresa.replace({"nan": "", "None": ""})
 
-    df["CLIENTE"] = cliente.mask(cliente.eq(""), empresa)
-    df["CLIENTE"] = df["CLIENTE"].replace({"nan": "", "None": ""}).fillna("")
+    cliente_final = cliente.mask(cliente.eq(""), empresa)
+    cliente_final = cliente_final.replace({"nan": "", "None": ""}).fillna("")
 
+    # Quitamos duplicadas antes de asignar
+    df = drop_duplicate_columns(df)
+
+    if "CLIENTE" in df.columns:
+        df = df.drop(columns=["CLIENTE"])
+    if "EMPRESA" not in df.columns:
+        df["EMPRESA"] = empresa
+
+    df["CLIENTE"] = cliente_final
     return df
 
 
 def get_saldo_en_fecha(df: pd.DataFrame, fecha: pd.Timestamp, saldo_inicial: float) -> float:
     if df.empty:
         return saldo_inicial
-    tmp = df.copy()
-    tmp["FECHA"] = pd.to_datetime(tmp["FECHA"], errors="coerce").dt.normalize()
+    tmp = drop_duplicate_columns(df.copy())
+    tmp["FECHA"] = pd.to_datetime(get_first_series(tmp, "FECHA"), errors="coerce").dt.normalize()
     tmp = tmp[tmp["FECHA"] <= fecha].sort_values("FECHA")
     if tmp.empty or "SALDO" not in tmp.columns:
         return saldo_inicial
-    return float(tmp["SALDO"].iloc[-1])
+    return float(get_first_series(tmp, "SALDO").iloc[-1])
 
 
 def get_gastos_relevantes(
@@ -229,19 +262,19 @@ def get_gastos_relevantes(
     if df.empty:
         return pd.DataFrame()
 
-    tmp = df.copy()
-    tmp["FECHA"] = pd.to_datetime(tmp["FECHA"], errors="coerce").dt.normalize()
-    tmp["TIPO"] = tmp["TIPO"].astype(str).str.upper().str.strip()
+    tmp = drop_duplicate_columns(df.copy())
+    tmp["FECHA"] = pd.to_datetime(get_first_series(tmp, "FECHA"), errors="coerce").dt.normalize()
+    tmp["TIPO"] = get_first_series(tmp, "TIPO").astype(str).str.upper().str.strip()
 
     if "PAGADO_BOOL" in tmp.columns:
-        tmp = tmp[~tmp["PAGADO_BOOL"].fillna(False)].copy()
+        tmp = tmp[~pd.to_numeric(get_first_series(tmp, "PAGADO_BOOL"), errors="coerce").fillna(0).astype(bool)].copy()
 
     if "PAGOS" in tmp.columns:
-        tmp["IMPORTE_ALERTA"] = pd.to_numeric(tmp["PAGOS"], errors="coerce")
+        tmp["IMPORTE_ALERTA"] = pd.to_numeric(get_first_series(tmp, "PAGOS"), errors="coerce")
     elif "IMPORTE_PRON" in tmp.columns:
-        tmp["IMPORTE_ALERTA"] = pd.to_numeric(tmp["IMPORTE_PRON"], errors="coerce")
+        tmp["IMPORTE_ALERTA"] = pd.to_numeric(get_first_series(tmp, "IMPORTE_PRON"), errors="coerce")
     elif "IMPORTE_REAL" in tmp.columns:
-        tmp["IMPORTE_ALERTA"] = pd.to_numeric(tmp["IMPORTE_REAL"], errors="coerce")
+        tmp["IMPORTE_ALERTA"] = pd.to_numeric(get_first_series(tmp, "IMPORTE_REAL"), errors="coerce")
     else:
         tmp["IMPORTE_ALERTA"] = 0.0
 
@@ -256,7 +289,6 @@ def get_gastos_relevantes(
 
     tmp["DIAS"] = (tmp["FECHA"] - fecha_base).dt.days
     tmp = tmp.sort_values(["FECHA", "IMPORTE_ALERTA"], ascending=[True, False])
-
     return tmp
 
 
@@ -269,18 +301,17 @@ def get_facturas_pendientes_proveedor(
     if df.empty:
         return pd.DataFrame()
 
-    tmp = df.copy()
-    tmp = drop_duplicate_columns(tmp)
+    tmp = drop_duplicate_columns(df.copy())
     tmp = coalesce_cliente_empresa(tmp)
 
-    tmp["FECHA"] = pd.to_datetime(tmp["FECHA"], errors="coerce").dt.normalize()
-    tmp["TIPO"] = tmp["TIPO"].astype(str).str.upper().str.strip()
-    tmp["ESTATUS"] = tmp["ESTATUS"].astype(str).str.upper().str.strip()
+    tmp["FECHA"] = pd.to_datetime(get_first_series(tmp, "FECHA"), errors="coerce").dt.normalize()
+    tmp["TIPO"] = get_first_series(tmp, "TIPO").astype(str).str.upper().str.strip()
+    tmp["ESTATUS"] = get_first_series(tmp, "ESTATUS").astype(str).str.upper().str.strip()
 
     if "PAGOS" in tmp.columns:
-        tmp["IMPORTE_FACTURA"] = pd.to_numeric(tmp["PAGOS"], errors="coerce").fillna(0.0)
+        tmp["IMPORTE_FACTURA"] = pd.to_numeric(get_first_series(tmp, "PAGOS"), errors="coerce").fillna(0.0)
     elif "IMPORTE_PRON" in tmp.columns:
-        tmp["IMPORTE_FACTURA"] = pd.to_numeric(tmp["IMPORTE_PRON"], errors="coerce").fillna(0.0)
+        tmp["IMPORTE_FACTURA"] = pd.to_numeric(get_first_series(tmp, "IMPORTE_PRON"), errors="coerce").fillna(0.0)
     else:
         tmp["IMPORTE_FACTURA"] = 0.0
 
@@ -292,13 +323,12 @@ def get_facturas_pendientes_proveedor(
     ].copy()
 
     if proveedor_query.strip():
-        mask_cliente = tmp["CLIENTE"].astype(str).str.contains(proveedor_query, case=False, na=False)
-        mask_concepto = tmp["CONCEPTO"].astype(str).str.contains(proveedor_query, case=False, na=False)
+        mask_cliente = get_first_series(tmp, "CLIENTE").astype(str).str.contains(proveedor_query, case=False, na=False)
+        mask_concepto = get_first_series(tmp, "CONCEPTO").astype(str).str.contains(proveedor_query, case=False, na=False)
         tmp = tmp[mask_cliente | mask_concepto].copy()
 
-    tmp["Proveedor"] = tmp["CLIENTE"].fillna("").astype(str).str.strip()
+    tmp["Proveedor"] = get_first_series(tmp, "CLIENTE").fillna("").astype(str).str.strip()
     tmp["Proveedor"] = tmp["Proveedor"].replace("", "SIN IDENTIFICAR")
-
     tmp["Dias hasta vencimiento"] = (tmp["FECHA"] - pd.Timestamp(date.today()).normalize()).dt.days
     tmp = tmp.sort_values(["FECHA", "Proveedor", "IMPORTE_FACTURA"], ascending=[True, True, False]).reset_index(drop=True)
     return tmp
@@ -308,12 +338,12 @@ def format_currency_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     out = df.copy()
     for c in cols:
         if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce").map(eur)
+            out[c] = pd.to_numeric(get_first_series(out, c), errors="coerce").map(eur)
     return out
 
 
 # -----------------------------
-# Leer hoja BANCOS (NUEVA ESTRUCTURA)
+# Leer hoja BANCOS
 # -----------------------------
 def read_bancos_from_excel(uploaded_file) -> dict:
     uploaded_file.seek(0)
@@ -349,8 +379,6 @@ def read_bancos_from_excel(uploaded_file) -> dict:
     total_dispuesto = None
     total_polizas = None
     total_disponible = None
-    cuenta_suplidos = None
-    cuenta_efectivo = None
 
     for r in range(1, ws.max_row + 1):
         a = norm(ws.cell(r, 1).value)
@@ -360,21 +388,12 @@ def read_bancos_from_excel(uploaded_file) -> dict:
 
         if a == "TOTAL CTAS":
             total_ctas = to_num(b)
-
         if d == "TOTAL DISPUESTO":
             total_dispuesto = to_num(e)
-
         if a == "TOTAL POLIZAS":
             total_polizas = to_num(b)
-
         if d == "TOTAL DISPONIBLE":
             total_disponible = to_num(e)
-
-        if a == "CUENTA SUPLIDOS":
-            cuenta_suplidos = to_num(b)
-
-        if a == "CUENTA DE EFECTIVO":
-            cuenta_efectivo = to_num(b)
 
     if total_ctas is None:
         raise ValueError("No puedo leer 'TOTAL CTAS' en la hoja BANCOS.")
@@ -395,8 +414,6 @@ def read_bancos_from_excel(uploaded_file) -> dict:
         "total_polizas": float(total_polizas),
         "total_disponible": float(total_disponible),
         "capacidad_total_cobertura": float(capacidad_total_cobertura),
-        "cuenta_suplidos": cuenta_suplidos,
-        "cuenta_efectivo": cuenta_efectivo,
     }
 
 
@@ -429,17 +446,17 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
 
     if "PRORRATEO" not in df.columns:
         df["PRORRATEO"] = ""
-    df["PRORRATEO"] = df["PRORRATEO"].astype(str).str.strip().str.upper()
+    df["PRORRATEO"] = get_first_series(df, "PRORRATEO").astype(str).str.strip().str.upper()
 
     if "PAGADO" not in df.columns:
         df["PAGADO"] = ""
 
     if "FECHA" in df.columns:
-        df["FECHA_PAGO"] = pd.to_datetime(df["FECHA"], errors="coerce", dayfirst=True).dt.normalize()
+        df["FECHA_PAGO"] = pd.to_datetime(get_first_series(df, "FECHA"), errors="coerce", dayfirst=True).dt.normalize()
     else:
         df["FECHA_PAGO"] = pd.NaT
 
-    df["PAGADO_BOOL"] = df["PAGADO"].apply(is_pagado) | df["FECHA_PAGO"].notna()
+    df["PAGADO_BOOL"] = get_first_series(df, "PAGADO").apply(is_pagado) | df["FECHA_PAGO"].notna()
 
     if "IMPORTE PRONOSTICADO" not in df.columns:
         raise ValueError("Falta columna: 'IMPORTE PRONOSTICADO' o su alias 'PREVISION'")
@@ -449,7 +466,7 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
 
     if "HASTA" not in df.columns:
         df["HASTA"] = pd.NaT
-    df["HASTA"] = pd.to_datetime(df["HASTA"], errors="coerce", dayfirst=True).dt.normalize()
+    df["HASTA"] = pd.to_datetime(get_first_series(df, "HASTA"), errors="coerce", dayfirst=True).dt.normalize()
 
     df = df.dropna(how="all").copy()
 
@@ -466,21 +483,21 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     ]:
         if c not in df.columns:
             df[c] = ""
-        df[c] = df[c].astype(str).str.strip()
+        df[c] = get_first_series(df, c).astype(str).str.strip()
 
     df = coalesce_cliente_empresa(df)
     df = drop_duplicate_columns(df)
 
-    df["TIPO"] = df["TIPO"].astype(str).str.upper()
-    df["DEPARTAMENTO"] = df["DEPARTAMENTO"].astype(str).str.upper()
-    df["NATURALEZA"] = df["NATURALEZA"].astype(str).str.upper()
-    df["PERIODICIDAD"] = df["PERIODICIDAD"].astype(str).str.upper()
-    df["REGLA_FECHA"] = df["REGLA_FECHA"].astype(str).str.upper()
-    df["AJUSTE FINDE"] = df["AJUSTE FINDE"].astype(str).str.upper()
+    df["TIPO"] = get_first_series(df, "TIPO").astype(str).str.upper()
+    df["DEPARTAMENTO"] = get_first_series(df, "DEPARTAMENTO").astype(str).str.upper()
+    df["NATURALEZA"] = get_first_series(df, "NATURALEZA").astype(str).str.upper()
+    df["PERIODICIDAD"] = get_first_series(df, "PERIODICIDAD").astype(str).str.upper()
+    df["REGLA_FECHA"] = get_first_series(df, "REGLA_FECHA").astype(str).str.upper()
+    df["AJUSTE FINDE"] = get_first_series(df, "AJUSTE FINDE").astype(str).str.upper()
 
-    df["IMPORTE_PRON"] = pd.to_numeric(df["IMPORTE PRONOSTICADO"], errors="coerce").fillna(0.0)
-    df["IMPORTE_REAL"] = pd.to_numeric(df["IMPORTE REAL"], errors="coerce").fillna(0.0)
-    df["LAG"] = pd.to_numeric(df["LAG"], errors="coerce").fillna(0).astype(int)
+    df["IMPORTE_PRON"] = pd.to_numeric(get_first_series(df, "IMPORTE PRONOSTICADO"), errors="coerce").fillna(0.0)
+    df["IMPORTE_REAL"] = pd.to_numeric(get_first_series(df, "IMPORTE REAL"), errors="coerce").fillna(0.0)
+    df["LAG"] = pd.to_numeric(get_first_series(df, "LAG"), errors="coerce").fillna(0).astype(int)
 
     def to_day_of_month(v):
         if pd.isna(v):
@@ -511,11 +528,11 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
 
         return None
 
-    df["DIA_MES"] = df["VALOR_FECHA"].apply(to_day_of_month)
-    df["FECHA_FIJA"] = pd.to_datetime(df["VALOR_FECHA"], errors="coerce", dayfirst=True).dt.normalize()
-    df["FECHA_CARGO_GASTO_DT"] = pd.to_datetime(df["FECHA CARGO GASTO"], errors="coerce", dayfirst=True).dt.normalize()
+    df["DIA_MES"] = get_first_series(df, "VALOR_FECHA").apply(to_day_of_month)
+    df["FECHA_FIJA"] = pd.to_datetime(get_first_series(df, "VALOR_FECHA"), errors="coerce", dayfirst=True).dt.normalize()
+    df["FECHA_CARGO_GASTO_DT"] = pd.to_datetime(get_first_series(df, "FECHA CARGO GASTO"), errors="coerce", dayfirst=True).dt.normalize()
 
-    return df
+    return drop_duplicate_columns(df)
 
 
 def next_business_day(d: pd.Timestamp) -> pd.Timestamp:
@@ -623,9 +640,6 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         hasta = r.get("HASTA", pd.NaT)
         hasta = pd.Timestamp(hasta).normalize() if not pd.isna(hasta) else pd.NaT
 
-        def apply_adjustments(d: pd.Timestamp) -> pd.Timestamp:
-            return apply_row_adjustments(d, ajuste, lag)
-
         def within_limits(d: pd.Timestamp) -> bool:
             if d < start_date or d > end_date:
                 return False
@@ -637,7 +651,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
             d_base = pd.Timestamp(d_base).normalize()
             if not within_limits(d_base):
                 return
-            d_adj = apply_adjustments(d_base)
+            d_adj = apply_row_adjustments(d_base, ajuste, lag)
             if d_adj < start_date or d_adj > end_date:
                 return
             rows.append((d_adj, r))
@@ -782,7 +796,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
     } for d, rr in rows])
 
     out = coalesce_cliente_empresa(out)
-    out["FECHA_PAGO"] = pd.to_datetime(out["FECHA_PAGO"], errors="coerce").dt.normalize()
+    out["FECHA_PAGO"] = pd.to_datetime(get_first_series(out, "FECHA_PAGO"), errors="coerce").dt.normalize()
     out["ESTATUS"] = out.apply(
         lambda x: estado_cobro_pago(x.get("TIPO", ""), bool(x.get("PAGADO_BOOL", False))),
         axis=1
@@ -848,8 +862,8 @@ def build_real_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timesta
 
     out = pd.DataFrame(rows)
     out = coalesce_cliente_empresa(out)
-    out["FECHA"] = pd.to_datetime(out["FECHA"], errors="coerce").dt.normalize()
-    out["FECHA_PAGO"] = pd.to_datetime(out["FECHA_PAGO"], errors="coerce").dt.normalize()
+    out["FECHA"] = pd.to_datetime(get_first_series(out, "FECHA"), errors="coerce").dt.normalize()
+    out["FECHA_PAGO"] = pd.to_datetime(get_first_series(out, "FECHA_PAGO"), errors="coerce").dt.normalize()
     out = drop_duplicate_columns(out)
     out = out.sort_values(["FECHA", "CONCEPTO", "CLIENTE"]).reset_index(drop=True)
     return out
@@ -951,15 +965,15 @@ st.sidebar.header("Filtros base")
 
 all_deptos = sorted(
     pd.concat([
-        generated_pron["DEPARTAMENTO"] if not generated_pron.empty else pd.Series(dtype=str),
-        generated_real["DEPARTAMENTO"] if not generated_real.empty else pd.Series(dtype=str),
+        get_first_series(generated_pron, "DEPARTAMENTO") if not generated_pron.empty else pd.Series(dtype=str),
+        get_first_series(generated_real, "DEPARTAMENTO") if not generated_real.empty else pd.Series(dtype=str),
     ], ignore_index=True).dropna().astype(str).unique().tolist()
 )
 
 all_tipos = sorted(
     pd.concat([
-        generated_pron["TIPO"] if not generated_pron.empty else pd.Series(dtype=str),
-        generated_real["TIPO"] if not generated_real.empty else pd.Series(dtype=str),
+        get_first_series(generated_pron, "TIPO") if not generated_pron.empty else pd.Series(dtype=str),
+        get_first_series(generated_real, "TIPO") if not generated_real.empty else pd.Series(dtype=str),
     ], ignore_index=True).dropna().astype(str).unique().tolist()
 )
 
@@ -967,13 +981,13 @@ sel_deptos = st.sidebar.multiselect("Departamento", options=all_deptos, default=
 sel_tipos = st.sidebar.multiselect("Tipo", options=all_tipos, default=all_tipos)
 
 base_filtered_pron = generated_pron[
-    generated_pron["DEPARTAMENTO"].isin(sel_deptos) &
-    generated_pron["TIPO"].isin(sel_tipos)
+    get_first_series(generated_pron, "DEPARTAMENTO").isin(sel_deptos) &
+    get_first_series(generated_pron, "TIPO").isin(sel_tipos)
 ].copy().sort_values("FECHA").reset_index(drop=True) if not generated_pron.empty else generated_pron.copy()
 
 base_filtered_real = generated_real[
-    generated_real["DEPARTAMENTO"].isin(sel_deptos) &
-    generated_real["TIPO"].isin(sel_tipos)
+    get_first_series(generated_real, "DEPARTAMENTO").isin(sel_deptos) &
+    get_first_series(generated_real, "TIPO").isin(sel_tipos)
 ].copy().sort_values("FECHA").reset_index(drop=True) if not generated_real.empty else generated_real.copy()
 
 base_filtered_pron = drop_duplicate_columns(base_filtered_pron)
@@ -982,26 +996,28 @@ base_filtered_real = drop_duplicate_columns(base_filtered_real)
 # -----------------------------
 # Lógica tesorería
 # -----------------------------
-pron_df = base_filtered_pron.copy().sort_values("FECHA").reset_index(drop=True)
-pron_df = drop_duplicate_columns(pron_df)
+pron_df = drop_duplicate_columns(base_filtered_pron.copy().sort_values("FECHA").reset_index(drop=True))
 
-pron_pendientes_df = base_filtered_pron[
-    ~base_filtered_pron["PAGADO_BOOL"]
-].copy().sort_values("FECHA").reset_index(drop=True)
-pron_pendientes_df = drop_duplicate_columns(pron_pendientes_df)
+pron_pendientes_df = drop_duplicate_columns(
+    base_filtered_pron[~pd.to_numeric(get_first_series(base_filtered_pron, "PAGADO_BOOL"), errors="coerce").fillna(0).astype(bool)]
+    .copy()
+    .sort_values("FECHA")
+    .reset_index(drop=True)
+)
 
-real_df = base_filtered_real[
-    base_filtered_real["PAGADO_BOOL"]
-].copy().sort_values("FECHA").reset_index(drop=True)
-real_df = drop_duplicate_columns(real_df)
+real_df = drop_duplicate_columns(
+    base_filtered_real[pd.to_numeric(get_first_series(base_filtered_real, "PAGADO_BOOL"), errors="coerce").fillna(0).astype(bool)]
+    .copy()
+    .sort_values("FECHA")
+    .reset_index(drop=True)
+)
 
-real_df["FECHA"] = pd.to_datetime(real_df["FECHA"], errors="coerce").dt.normalize()
+real_df["FECHA"] = pd.to_datetime(get_first_series(real_df, "FECHA"), errors="coerce").dt.normalize()
 real_df["ESTATUS"] = real_df.apply(
     lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
     axis=1
 )
-real_df = drop_duplicate_columns(real_df)
-real_df = real_df.sort_values("FECHA").reset_index(drop=True)
+real_df = drop_duplicate_columns(real_df).sort_values("FECHA").reset_index(drop=True)
 
 consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON") if not pron_df.empty else pron_df.copy()
 consolidado_pron_pend = compute_balance_from_amount(pron_pendientes_df, saldo_hoy, "IMPORTE_PRON") if not pron_pendientes_df.empty else pron_pendientes_df.copy()
@@ -1049,13 +1065,9 @@ consolidado_pron2 = pd.concat([base_row, consolidado_pron], ignore_index=True) i
 consolidado_pron_pend2 = pd.concat([base_row, consolidado_pron_pend], ignore_index=True) if not consolidado_pron_pend.empty else base_row.copy()
 consolidado_real2 = pd.concat([base_row, consolidado_real], ignore_index=True) if not consolidado_real.empty else base_row.copy()
 
-consolidado_pron2 = coalesce_cliente_empresa(consolidado_pron2)
-consolidado_pron_pend2 = coalesce_cliente_empresa(consolidado_pron_pend2)
-consolidado_real2 = coalesce_cliente_empresa(consolidado_real2)
-
-consolidado_pron2 = drop_duplicate_columns(consolidado_pron2)
-consolidado_pron_pend2 = drop_duplicate_columns(consolidado_pron_pend2)
-consolidado_real2 = drop_duplicate_columns(consolidado_real2)
+consolidado_pron2 = drop_duplicate_columns(coalesce_cliente_empresa(consolidado_pron2))
+consolidado_pron_pend2 = drop_duplicate_columns(coalesce_cliente_empresa(consolidado_pron_pend2))
+consolidado_real2 = drop_duplicate_columns(coalesce_cliente_empresa(consolidado_real2))
 
 # -----------------------------
 # Búsqueda y rango
@@ -1072,8 +1084,14 @@ sel_estatus = st.sidebar.multiselect(
     default=estatus_options
 )
 
-min_d = min(consolidado_pron2["FECHA"].min(), consolidado_real2["FECHA"].min()).date()
-max_d = max(consolidado_pron2["FECHA"].max(), consolidado_real2["FECHA"].max()).date()
+min_d = min(
+    pd.to_datetime(get_first_series(consolidado_pron2, "FECHA"), errors="coerce").min().date(),
+    pd.to_datetime(get_first_series(consolidado_real2, "FECHA"), errors="coerce").min().date()
+)
+max_d = max(
+    pd.to_datetime(get_first_series(consolidado_pron2, "FECHA"), errors="coerce").max().date(),
+    pd.to_datetime(get_first_series(consolidado_real2, "FECHA"), errors="coerce").max().date()
+)
 
 date_range = st.sidebar.date_input(
     "Rango de fechas",
@@ -1089,32 +1107,27 @@ else:
 
 
 def apply_visual_filters(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out = drop_duplicate_columns(out)
+    out = drop_duplicate_columns(df.copy())
     out = coalesce_cliente_empresa(out)
+    out["FECHA"] = pd.to_datetime(get_first_series(out, "FECHA"), errors="coerce").dt.normalize()
+
     out = out[(out["FECHA"].dt.date >= d_from) & (out["FECHA"].dt.date <= d_to)].copy()
 
     if q_concepto:
-        out = out[out["CONCEPTO"].astype(str).str.contains(q_concepto, case=False, na=False)].copy()
+        out = out[get_first_series(out, "CONCEPTO").astype(str).str.contains(q_concepto, case=False, na=False)].copy()
 
     if q_cliente:
-        if "CLIENTE" in out.columns:
-            out = out[out["CLIENTE"].astype(str).str.contains(q_cliente, case=False, na=False)].copy()
-        else:
-            out = out.iloc[0:0].copy()
+        out = out[get_first_series(out, "CLIENTE").astype(str).str.contains(q_cliente, case=False, na=False)].copy()
 
     if sel_estatus:
-        if "ESTATUS" in out.columns:
-            out = out[out["ESTATUS"].astype(str).str.upper().isin(sel_estatus)].copy()
-        else:
-            out = out.iloc[0:0].copy()
+        out = out[get_first_series(out, "ESTATUS").astype(str).str.upper().isin(sel_estatus)].copy()
 
     return out.sort_values("FECHA").reset_index(drop=True)
 
 
 view_pron = apply_visual_filters(consolidado_pron_pend2)
 view_real = apply_visual_filters(consolidado_real2)
-view_real = view_real[view_real["ESTATUS"].isin(["PAGADO", "COBRADO"])].copy()
+view_real = view_real[get_first_series(view_real, "ESTATUS").isin(["PAGADO", "COBRADO"])].copy()
 
 # -----------------------------
 # KPIs
@@ -1131,11 +1144,11 @@ pagos_pendientes_hasta = 0.0
 cobros_pendientes_hasta = 0.0
 
 if not pron_pendientes_df.empty:
-    pron_hasta_obj = pron_pendientes_df[pron_pendientes_df["FECHA"] <= fecha_objetivo].copy()
+    pron_hasta_obj = pron_pendientes_df[pd.to_datetime(get_first_series(pron_pendientes_df, "FECHA"), errors="coerce").dt.normalize() <= fecha_objetivo].copy()
     if not pron_hasta_obj.empty:
         pron_hasta_obj = compute_balance_from_amount(pron_hasta_obj, saldo_hoy, "IMPORTE_PRON")
-        pagos_pendientes_hasta = float(pron_hasta_obj["PAGOS"].sum())
-        cobros_pendientes_hasta = float(pron_hasta_obj["COBROS"].sum())
+        pagos_pendientes_hasta = float(get_first_series(pron_hasta_obj, "PAGOS").sum())
+        cobros_pendientes_hasta = float(get_first_series(pron_hasta_obj, "COBROS").sum())
 
 gastos_alerta = get_gastos_relevantes(pron_pendientes_df, start_ts, dias=30, umbral=3000.0)
 
@@ -1161,7 +1174,7 @@ with c8:
     st.metric(f"Pagos pendientes hasta {fecha_objetivo.strftime('%d-%m-%Y')}", eur(pagos_pendientes_hasta))
 
 # -----------------------------
-# Alertas simples de gastos elevados
+# Alertas
 # -----------------------------
 st.subheader("Alertas de gastos elevados")
 
@@ -1185,7 +1198,6 @@ else:
             "En": lambda x: f"{int(x)} días"
         })
     )
-
     st.dataframe(styled_alertas, use_container_width=True)
 
 # -----------------------------
@@ -1209,7 +1221,6 @@ daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(saldo_hoy)
 daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(saldo_hoy)
 
 daily["DESVIACION"] = daily["SALDO_REAL"] - daily["SALDO_PRON"]
-
 daily["AREA_POS_TOP"] = daily[["SALDO_REAL", "SALDO_PRON"]].max(axis=1)
 daily["AREA_POS_BOTTOM"] = daily[["SALDO_REAL", "SALDO_PRON"]].min(axis=1)
 daily["AREA_NEG_TOP"] = daily["AREA_POS_TOP"]
@@ -1238,14 +1249,8 @@ plot_df = daily_zoom.melt(
 )
 plot_df["SERIE"] = plot_df["SERIE"].map(series_map)
 
-domain = [
-    "Pronosticado",
-    "Real (estimado/ejecutado)",
-]
-range_ = [
-    "#6BAED6",
-    "#08519C",
-]
+domain = ["Pronosticado", "Real (estimado/ejecutado)"]
+range_ = ["#6BAED6", "#08519C"]
 
 chart_interval = alt.selection_interval(bind="scales")
 
@@ -1384,14 +1389,14 @@ else:
     )
 
 # -----------------------------
-# Movimientos — PRON
+# Movimientos PRON
 # -----------------------------
 st.subheader("Movimientos (formato tesorería) — PRON (pendientes)")
 
-mov_pron = view_pron[view_pron["ESTATUS"] == "PENDIENTE"].copy()
+mov_pron = view_pron[get_first_series(view_pron, "ESTATUS") == "PENDIENTE"].copy()
 mov_pron = coalesce_cliente_empresa(mov_pron)
-mov_pron["VTO. PAGO"] = mov_pron["FECHA"].dt.strftime("%d-%m-%y")
-mov_pron["COBRADO/PAGADO"] = mov_pron["ESTATUS"]
+mov_pron["VTO. PAGO"] = pd.to_datetime(get_first_series(mov_pron, "FECHA")).dt.strftime("%d-%m-%y")
+mov_pron["COBRADO/PAGADO"] = get_first_series(mov_pron, "ESTATUS")
 
 pron_cols = ["VTO. PAGO", "CONCEPTO", "CLIENTE", "COBRADO/PAGADO", "COBROS", "PAGOS", "SALDO"]
 for c in pron_cols:
@@ -1410,14 +1415,14 @@ styled_pron = (
 st.dataframe(styled_pron, use_container_width=True)
 
 # -----------------------------
-# Movimientos — REAL
+# Movimientos REAL
 # -----------------------------
 st.subheader("Movimientos (formato tesorería) — REAL (estimado/ejecutado)")
 
 mov_real = view_real.copy()
 mov_real = coalesce_cliente_empresa(mov_real)
-mov_real["VTO. PAGO"] = mov_real["FECHA"].dt.strftime("%d-%m-%y")
-mov_real["COBRADO/PAGADO"] = mov_real["ESTATUS"]
+mov_real["VTO. PAGO"] = pd.to_datetime(get_first_series(mov_real, "FECHA")).dt.strftime("%d-%m-%y")
+mov_real["COBRADO/PAGADO"] = get_first_series(mov_real, "ESTATUS")
 
 real_cols = ["VTO. PAGO", "CONCEPTO", "CLIENTE", "COBRADO/PAGADO", "COBROS", "PAGOS", "SALDO"]
 for c in real_cols:
@@ -1449,7 +1454,8 @@ modo_resumen = st.radio(
 
 
 def resumen_mensual(df_base: pd.DataFrame, d_from: date, d_to: date) -> pd.DataFrame:
-    df = df_base.copy()
+    df = drop_duplicate_columns(df_base.copy())
+    df["FECHA"] = pd.to_datetime(get_first_series(df, "FECHA"), errors="coerce")
     df = df[(df["FECHA"].dt.date >= d_from) & (df["FECHA"].dt.date <= d_to)].copy()
     df["MES"] = df["FECHA"].dt.to_period("M").astype(str)
 
