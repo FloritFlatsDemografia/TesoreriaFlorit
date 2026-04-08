@@ -72,10 +72,6 @@ def drop_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_first_series(df: pd.DataFrame, colname: str, default="") -> pd.Series:
-    """
-    Devuelve SIEMPRE una Series aunque existan columnas duplicadas.
-    Si no existe la columna, devuelve una Series con el valor por defecto.
-    """
     if colname not in df.columns:
         return pd.Series([default] * len(df), index=df.index, dtype="object")
 
@@ -213,9 +209,6 @@ def safe_deviation_pct(real_value: float, pron_value: float) -> float:
 
 
 def coalesce_cliente_empresa(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Robusta frente a columnas duplicadas.
-    """
     df = df.copy()
 
     cliente = get_first_series(df, "CLIENTE", default="")
@@ -230,7 +223,6 @@ def coalesce_cliente_empresa(df: pd.DataFrame) -> pd.DataFrame:
     cliente_final = cliente.mask(cliente.eq(""), empresa)
     cliente_final = cliente_final.replace({"nan": "", "None": ""}).fillna("")
 
-    # Quitamos duplicadas antes de asignar
     df = drop_duplicate_columns(df)
 
     if "CLIENTE" in df.columns:
@@ -267,7 +259,12 @@ def get_gastos_relevantes(
     tmp["TIPO"] = get_first_series(tmp, "TIPO").astype(str).str.upper().str.strip()
 
     if "PAGADO_BOOL" in tmp.columns:
-        tmp = tmp[~pd.to_numeric(get_first_series(tmp, "PAGADO_BOOL"), errors="coerce").fillna(0).astype(bool)].copy()
+        pagado_bool = get_first_series(tmp, "PAGADO_BOOL")
+        if pagado_bool.dtype != bool:
+            pagado_bool = pagado_bool.fillna(False).astype(str).str.lower().isin(
+                ["true", "1", "si", "sí", "x", "ok", "pagado", "yes", "y"]
+            )
+        tmp = tmp[~pagado_bool].copy()
 
     if "PAGOS" in tmp.columns:
         tmp["IMPORTE_ALERTA"] = pd.to_numeric(get_first_series(tmp, "PAGOS"), errors="coerce")
@@ -797,10 +794,13 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
 
     out = coalesce_cliente_empresa(out)
     out["FECHA_PAGO"] = pd.to_datetime(get_first_series(out, "FECHA_PAGO"), errors="coerce").dt.normalize()
-    out["ESTATUS"] = out.apply(
-        lambda x: estado_cobro_pago(x.get("TIPO", ""), bool(x.get("PAGADO_BOOL", False))),
-        axis=1
-    )
+
+    if "ESTATUS" not in out.columns:
+        out["ESTATUS"] = out.apply(
+            lambda x: estado_cobro_pago(x.get("TIPO", ""), bool(x.get("PAGADO_BOOL", False))),
+            axis=1
+        )
+
     out = drop_duplicate_columns(out)
     return out.sort_values("FECHA").reset_index(drop=True)
 
@@ -999,43 +999,44 @@ base_filtered_real = drop_duplicate_columns(base_filtered_real)
 pron_df = drop_duplicate_columns(base_filtered_pron.copy().sort_values("FECHA").reset_index(drop=True))
 
 pron_pendientes_df = drop_duplicate_columns(
-    base_filtered_pron[~pd.to_numeric(get_first_series(base_filtered_pron, "PAGADO_BOOL"), errors="coerce").fillna(0).astype(bool)]
-    .copy()
-    .sort_values("FECHA")
-    .reset_index(drop=True)
+    base_filtered_pron[
+        ~pd.to_numeric(get_first_series(base_filtered_pron, "PAGADO_BOOL"), errors="coerce").fillna(0).astype(bool)
+    ].copy().sort_values("FECHA").reset_index(drop=True)
 )
 
 real_df = drop_duplicate_columns(
-    base_filtered_real[pd.to_numeric(get_first_series(base_filtered_real, "PAGADO_BOOL"), errors="coerce").fillna(0).astype(bool)]
-    .copy()
-    .sort_values("FECHA")
-    .reset_index(drop=True)
+    base_filtered_real[
+        pd.to_numeric(get_first_series(base_filtered_real, "PAGADO_BOOL"), errors="coerce").fillna(0).astype(bool)
+    ].copy().sort_values("FECHA").reset_index(drop=True)
 )
 
 real_df["FECHA"] = pd.to_datetime(get_first_series(real_df, "FECHA"), errors="coerce").dt.normalize()
-real_df["ESTATUS"] = real_df.apply(
-    lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
-    axis=1
-)
+
+if "ESTATUS" not in real_df.columns:
+    real_df["ESTATUS"] = real_df.apply(
+        lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
+        axis=1
+    )
+
 real_df = drop_duplicate_columns(real_df).sort_values("FECHA").reset_index(drop=True)
 
 consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON") if not pron_df.empty else pron_df.copy()
 consolidado_pron_pend = compute_balance_from_amount(pron_pendientes_df, saldo_hoy, "IMPORTE_PRON") if not pron_pendientes_df.empty else pron_pendientes_df.copy()
 consolidado_real = compute_balance_from_amount(real_df, saldo_hoy, "IMPORTE_REAL") if not real_df.empty else real_df.copy()
 
-if not consolidado_pron.empty:
+if not consolidado_pron.empty and "ESTATUS" not in consolidado_pron.columns:
     consolidado_pron["ESTATUS"] = consolidado_pron.apply(
         lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
         axis=1
     )
 
-if not consolidado_pron_pend.empty:
+if not consolidado_pron_pend.empty and "ESTATUS" not in consolidado_pron_pend.columns:
     consolidado_pron_pend["ESTATUS"] = consolidado_pron_pend.apply(
         lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
         axis=1
     )
 
-if not consolidado_real.empty:
+if not consolidado_real.empty and "ESTATUS" not in consolidado_real.columns:
     consolidado_real["ESTATUS"] = consolidado_real.apply(
         lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
         axis=1
@@ -1144,7 +1145,9 @@ pagos_pendientes_hasta = 0.0
 cobros_pendientes_hasta = 0.0
 
 if not pron_pendientes_df.empty:
-    pron_hasta_obj = pron_pendientes_df[pd.to_datetime(get_first_series(pron_pendientes_df, "FECHA"), errors="coerce").dt.normalize() <= fecha_objetivo].copy()
+    pron_hasta_obj = pron_pendientes_df[
+        pd.to_datetime(get_first_series(pron_pendientes_df, "FECHA"), errors="coerce").dt.normalize() <= fecha_objetivo
+    ].copy()
     if not pron_hasta_obj.empty:
         pron_hasta_obj = compute_balance_from_amount(pron_hasta_obj, saldo_hoy, "IMPORTE_PRON")
         pagos_pendientes_hasta = float(get_first_series(pron_hasta_obj, "PAGOS").sum())
