@@ -64,6 +64,11 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def drop_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    return df.loc[:, ~df.columns.duplicated()]
+
+
 def apply_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -255,6 +260,50 @@ def get_gastos_relevantes(
     return tmp
 
 
+def get_facturas_pendientes_proveedor(
+    df: pd.DataFrame,
+    d_from: date,
+    d_to: date,
+    proveedor_query: str = ""
+) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    tmp = df.copy()
+    tmp = drop_duplicate_columns(tmp)
+    tmp = coalesce_cliente_empresa(tmp)
+
+    tmp["FECHA"] = pd.to_datetime(tmp["FECHA"], errors="coerce").dt.normalize()
+    tmp["TIPO"] = tmp["TIPO"].astype(str).str.upper().str.strip()
+    tmp["ESTATUS"] = tmp["ESTATUS"].astype(str).str.upper().str.strip()
+
+    if "PAGOS" in tmp.columns:
+        tmp["IMPORTE_FACTURA"] = pd.to_numeric(tmp["PAGOS"], errors="coerce").fillna(0.0)
+    elif "IMPORTE_PRON" in tmp.columns:
+        tmp["IMPORTE_FACTURA"] = pd.to_numeric(tmp["IMPORTE_PRON"], errors="coerce").fillna(0.0)
+    else:
+        tmp["IMPORTE_FACTURA"] = 0.0
+
+    tmp = tmp[
+        (tmp["TIPO"] == "GASTO") &
+        (tmp["ESTATUS"] == "PENDIENTE") &
+        (tmp["FECHA"].dt.date >= d_from) &
+        (tmp["FECHA"].dt.date <= d_to)
+    ].copy()
+
+    if proveedor_query.strip():
+        mask_cliente = tmp["CLIENTE"].astype(str).str.contains(proveedor_query, case=False, na=False)
+        mask_concepto = tmp["CONCEPTO"].astype(str).str.contains(proveedor_query, case=False, na=False)
+        tmp = tmp[mask_cliente | mask_concepto].copy()
+
+    tmp["Proveedor"] = tmp["CLIENTE"].fillna("").astype(str).str.strip()
+    tmp["Proveedor"] = tmp["Proveedor"].replace("", "SIN IDENTIFICAR")
+
+    tmp["Dias hasta vencimiento"] = (tmp["FECHA"] - pd.Timestamp(date.today()).normalize()).dt.days
+    tmp = tmp.sort_values(["FECHA", "Proveedor", "IMPORTE_FACTURA"], ascending=[True, True, False]).reset_index(drop=True)
+    return tmp
+
+
 def format_currency_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     out = df.copy()
     for c in cols:
@@ -365,6 +414,7 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     df = pd.read_excel(uploaded_file, sheet_name=0, header=header_idx, engine="openpyxl")
     df = normalize_cols(df)
     df = apply_column_aliases(df)
+    df = drop_duplicate_columns(df)
 
     missing = [c for c in MIN_REQUIRED if c not in df.columns]
     if missing:
@@ -389,7 +439,6 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
     else:
         df["FECHA_PAGO"] = pd.NaT
 
-    # Ejecutado si está marcado o si ya tiene fecha
     df["PAGADO_BOOL"] = df["PAGADO"].apply(is_pagado) | df["FECHA_PAGO"].notna()
 
     if "IMPORTE PRONOSTICADO" not in df.columns:
@@ -420,6 +469,7 @@ def read_catalog_from_excel(uploaded_file) -> pd.DataFrame:
         df[c] = df[c].astype(str).str.strip()
 
     df = coalesce_cliente_empresa(df)
+    df = drop_duplicate_columns(df)
 
     df["TIPO"] = df["TIPO"].astype(str).str.upper()
     df["DEPARTAMENTO"] = df["DEPARTAMENTO"].astype(str).str.upper()
@@ -737,6 +787,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
         lambda x: estado_cobro_pago(x.get("TIPO", ""), bool(x.get("PAGADO_BOOL", False))),
         axis=1
     )
+    out = drop_duplicate_columns(out)
     return out.sort_values("FECHA").reset_index(drop=True)
 
 
@@ -799,12 +850,13 @@ def build_real_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timesta
     out = coalesce_cliente_empresa(out)
     out["FECHA"] = pd.to_datetime(out["FECHA"], errors="coerce").dt.normalize()
     out["FECHA_PAGO"] = pd.to_datetime(out["FECHA_PAGO"], errors="coerce").dt.normalize()
+    out = drop_duplicate_columns(out)
     out = out.sort_values(["FECHA", "CONCEPTO", "CLIENTE"]).reset_index(drop=True)
     return out
 
 
 def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amount_col: str) -> pd.DataFrame:
-    df = df.copy()
+    df = drop_duplicate_columns(df.copy())
     df["COBROS"] = df.apply(lambda x: x[amount_col] if x["TIPO"] == "INGRESO" else 0.0, axis=1)
     df["PAGOS"] = df.apply(lambda x: x[amount_col] if x["TIPO"] == "GASTO" else 0.0, axis=1)
     df["NETO"] = df["COBROS"] - df["PAGOS"]
@@ -838,9 +890,6 @@ total_polizas = float(bancos["total_polizas"])
 total_disponible = float(bancos["total_disponible"])
 capacidad_total_cobertura = float(bancos["capacidad_total_cobertura"])
 
-cuenta_suplidos = bancos.get("cuenta_suplidos", None)
-cuenta_efectivo = bancos.get("cuenta_efectivo", None)
-
 st.sidebar.header("Bancos (desde Excel)")
 st.sidebar.metric("Saldo inicial neto", eur(saldo_hoy))
 st.sidebar.metric("TOTAL CTAS", eur(total_ctas))
@@ -848,11 +897,6 @@ st.sidebar.metric("TOTAL DISPUESTO", eur(total_dispuesto))
 st.sidebar.metric("TOTAL PÓLIZAS", eur(total_polizas))
 st.sidebar.metric("TOTAL DISPONIBLE", eur(total_disponible))
 st.sidebar.metric("Límite endeudamiento pólizas", eur(capacidad_total_cobertura))
-
-if cuenta_suplidos is not None:
-    st.sidebar.metric("CUENTA SUPLIDOS", eur(cuenta_suplidos))
-if cuenta_efectivo is not None:
-    st.sidebar.metric("CUENTA DE EFECTIVO", eur(cuenta_efectivo))
 
 try:
     catalog = read_catalog_from_excel(uploaded)
@@ -873,6 +917,9 @@ generated_real = build_real_events_from_catalog(
     start_date=start_ts,
     months_horizon=months_horizon
 )
+
+generated_pron = drop_duplicate_columns(generated_pron)
+generated_real = drop_duplicate_columns(generated_real)
 
 if dedupe_exact and not generated_pron.empty:
     generated_pron = generated_pron.drop_duplicates(
@@ -929,24 +976,31 @@ base_filtered_real = generated_real[
     generated_real["TIPO"].isin(sel_tipos)
 ].copy().sort_values("FECHA").reset_index(drop=True) if not generated_real.empty else generated_real.copy()
 
+base_filtered_pron = drop_duplicate_columns(base_filtered_pron)
+base_filtered_real = drop_duplicate_columns(base_filtered_real)
+
 # -----------------------------
 # Lógica tesorería
 # -----------------------------
 pron_df = base_filtered_pron.copy().sort_values("FECHA").reset_index(drop=True)
+pron_df = drop_duplicate_columns(pron_df)
 
 pron_pendientes_df = base_filtered_pron[
     ~base_filtered_pron["PAGADO_BOOL"]
 ].copy().sort_values("FECHA").reset_index(drop=True)
+pron_pendientes_df = drop_duplicate_columns(pron_pendientes_df)
 
 real_df = base_filtered_real[
     base_filtered_real["PAGADO_BOOL"]
 ].copy().sort_values("FECHA").reset_index(drop=True)
+real_df = drop_duplicate_columns(real_df)
 
 real_df["FECHA"] = pd.to_datetime(real_df["FECHA"], errors="coerce").dt.normalize()
 real_df["ESTATUS"] = real_df.apply(
     lambda r: estado_cobro_pago(r.get("TIPO", ""), bool(r.get("PAGADO_BOOL", False))),
     axis=1
 )
+real_df = drop_duplicate_columns(real_df)
 real_df = real_df.sort_values("FECHA").reset_index(drop=True)
 
 consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON") if not pron_df.empty else pron_df.copy()
@@ -999,12 +1053,17 @@ consolidado_pron2 = coalesce_cliente_empresa(consolidado_pron2)
 consolidado_pron_pend2 = coalesce_cliente_empresa(consolidado_pron_pend2)
 consolidado_real2 = coalesce_cliente_empresa(consolidado_real2)
 
+consolidado_pron2 = drop_duplicate_columns(consolidado_pron2)
+consolidado_pron_pend2 = drop_duplicate_columns(consolidado_pron_pend2)
+consolidado_real2 = drop_duplicate_columns(consolidado_real2)
+
 # -----------------------------
 # Búsqueda y rango
 # -----------------------------
 st.sidebar.header("Búsqueda y rango (solo visualización)")
 q_concepto = st.sidebar.text_input("Buscar concepto", value="").strip()
 q_cliente = st.sidebar.text_input("Buscar cliente / proveedor", value="").strip()
+q_factura_proveedor = st.sidebar.text_input("Buscar facturas pendientes proveedor", value="").strip()
 
 estatus_options = ["PAGADO", "COBRADO", "PENDIENTE"]
 sel_estatus = st.sidebar.multiselect(
@@ -1031,6 +1090,7 @@ else:
 
 def apply_visual_filters(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    out = drop_duplicate_columns(out)
     out = coalesce_cliente_empresa(out)
     out = out[(out["FECHA"].dt.date >= d_from) & (out["FECHA"].dt.date <= d_to)].copy()
 
@@ -1077,7 +1137,6 @@ if not pron_pendientes_df.empty:
         pagos_pendientes_hasta = float(pron_hasta_obj["PAGOS"].sum())
         cobros_pendientes_hasta = float(pron_hasta_obj["COBROS"].sum())
 
-# ALERTAS: usar dataset de pendientes real de previsión, no el visual filtrado
 gastos_alerta = get_gastos_relevantes(pron_pendientes_df, start_ts, dias=30, umbral=3000.0)
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -1159,7 +1218,6 @@ daily["AREA_NEG_BOTTOM"] = daily["AREA_POS_BOTTOM"]
 daily.loc[daily["DESVIACION"] < 0, ["AREA_POS_TOP", "AREA_POS_BOTTOM"]] = pd.NA
 daily.loc[daily["DESVIACION"] >= 0, ["AREA_NEG_TOP", "AREA_NEG_BOTTOM"]] = pd.NA
 
-# Línea roja gruesa: TOTAL PÓLIZAS
 daily["LINEA_TOTAL_POLIZAS"] = float(total_polizas)
 
 zoom_start = pd.Timestamp(d_from)
@@ -1260,6 +1318,70 @@ chart = (
 
 st.altair_chart(chart, use_container_width=True)
 st.caption("La línea roja gruesa representa el total de pólizas.")
+
+# -----------------------------
+# Facturas pendientes proveedor
+# -----------------------------
+st.subheader("Facturas pendientes de proveedor (gastos)")
+
+facturas_pendientes = get_facturas_pendientes_proveedor(
+    df=consolidado_pron_pend2,
+    d_from=d_from,
+    d_to=d_to,
+    proveedor_query=q_factura_proveedor
+)
+
+if facturas_pendientes.empty:
+    st.info("No hay facturas pendientes de proveedor en el rango seleccionado.")
+else:
+    total_facturas_rango = float(facturas_pendientes["IMPORTE_FACTURA"].sum())
+
+    proveedor_resumen = (
+        facturas_pendientes
+        .groupby("Proveedor", as_index=False)
+        .agg(
+            Facturas=("CONCEPTO", "count"),
+            Total=("IMPORTE_FACTURA", "sum")
+        )
+        .sort_values("Total", ascending=False)
+    )
+
+    cfp1, cfp2 = st.columns(2)
+    with cfp1:
+        st.metric(
+            f"Total pendiente en rango ({pd.Timestamp(d_from).strftime('%d-%m-%Y')} a {pd.Timestamp(d_to).strftime('%d-%m-%Y')})",
+            eur(total_facturas_rango)
+        )
+    with cfp2:
+        st.metric("Número de facturas pendientes", int(len(facturas_pendientes)))
+
+    st.markdown("#### Resumen por proveedor")
+    st.dataframe(
+        proveedor_resumen.style.format({"Total": eur}),
+        use_container_width=True
+    )
+
+    st.markdown("#### Desglose de facturas pendientes")
+    facturas_out = facturas_pendientes[[
+        "FECHA", "Proveedor", "CONCEPTO", "DEPARTAMENTO", "IMPORTE_FACTURA",
+        "Dias hasta vencimiento"
+    ]].copy()
+
+    facturas_out["FECHA"] = pd.to_datetime(facturas_out["FECHA"]).dt.strftime("%d-%m-%Y")
+    facturas_out = facturas_out.rename(columns={
+        "FECHA": "Vencimiento",
+        "CONCEPTO": "Concepto",
+        "DEPARTAMENTO": "Departamento",
+        "IMPORTE_FACTURA": "Importe",
+    })
+
+    st.dataframe(
+        facturas_out.style.format({
+            "Importe": eur,
+            "Dias hasta vencimiento": lambda x: f"{int(x)} días" if pd.notna(x) else ""
+        }),
+        use_container_width=True
+    )
 
 # -----------------------------
 # Movimientos — PRON
