@@ -91,17 +91,29 @@ def apply_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     alias_map = {
+        # Campos clave del catálogo
+        "DPTO": "DEPARTAMENTO",
+        "DEPARTAMENTO/DPTO": "DEPARTAMENTO",
+
+        # Importes
         "PREVISION": "IMPORTE PRONOSTICADO",
         "IMPORTE_PRONOSTICADO": "IMPORTE PRONOSTICADO",
+        "IMPORTE PREVISTO": "IMPORTE PRONOSTICADO",
         "IMPORTE REAL": "IMPORTE REAL",
         "IMPORTE_REAL": "IMPORTE REAL",
+
+        # Fechas y reglas
         "FECHA_CARGO_GASTO": "FECHA CARGO GASTO",
-        "AJUSTE_FINDE": "AJUSTE FINDE",
         "REGLA FECHA": "REGLA_FECHA",
         "VALOR FECHA": "VALOR_FECHA",
+        "AJUSTE_FINDE": "AJUSTE FINDE",
+
+        # IVA
         "TRATAMINETO_IVA": "TRATAMIENTO_IVA",
         "TRATAMIENTO IVA": "TRATAMIENTO_IVA",
         "TRATAMIENTO-IVA": "TRATAMIENTO_IVA",
+
+        # Otros
         "RAIZ_CUENTA_CONTABLE": "RAIZ CUENTA CONTABLE",
         "PERIODO SERVICIO": "PERIODO_SERVICIO",
     }
