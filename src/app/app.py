@@ -97,6 +97,7 @@ def apply_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
 
         # Importes
         "PREVISION": "IMPORTE PRONOSTICADO",
+        "PREVISIÓN": "IMPORTE PRONOSTICADO",
         "IMPORTE_PRONOSTICADO": "IMPORTE PRONOSTICADO",
         "IMPORTE PREVISTO": "IMPORTE PRONOSTICADO",
         "IMPORTE REAL": "IMPORTE REAL",
@@ -633,6 +634,91 @@ def apply_row_adjustments(d: pd.Timestamp, ajuste: str, lag: int) -> pd.Timestam
     return d.normalize()
 
 
+# -----------------------------
+# PRONÓSTICO DIRECTO DESDE EXCEL
+# -----------------------------
+def build_pron_events_direct_from_excel(
+    catalog: pd.DataFrame,
+    start_date: pd.Timestamp,
+    months_horizon: int
+) -> pd.DataFrame:
+    """
+    Construye el pronóstico usando exclusivamente:
+    - FECHA CARGO GASTO
+    - PREVISION / IMPORTE PRONOSTICADO
+    - TIPO: INGRESO o GASTO
+
+    No genera movimientos por periodicidad.
+    No duplica meses.
+    No interpreta reglas recurrentes.
+    """
+    end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
+
+    df = drop_duplicate_columns(catalog.copy())
+
+    df["FECHA"] = pd.to_datetime(
+        get_first_series(df, "FECHA_CARGO_GASTO_DT"),
+        errors="coerce",
+        dayfirst=True
+    ).dt.normalize()
+
+    if df["FECHA"].isna().all():
+        df["FECHA"] = pd.to_datetime(
+            get_first_series(df, "FECHA CARGO GASTO"),
+            errors="coerce",
+            dayfirst=True
+        ).dt.normalize()
+
+    df["TIPO"] = get_first_series(df, "TIPO").astype(str).str.upper().str.strip()
+
+    df["IMPORTE_PRON"] = pd.to_numeric(
+        get_first_series(df, "IMPORTE_PRON"),
+        errors="coerce"
+    ).fillna(0.0).abs()
+
+    df = df[
+        df["FECHA"].notna()
+        & (df["FECHA"] >= start_date)
+        & (df["FECHA"] <= end_date)
+        & df["TIPO"].isin(["INGRESO", "GASTO"])
+        & (df["IMPORTE_PRON"] != 0)
+    ].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "FECHA", "CONCEPTO", "TIPO", "DEPARTAMENTO", "CLIENTE", "EMPRESA",
+            "IMPORTE_PRON", "IMPORTE_REAL", "NATURALEZA", "PAGADO_BOOL",
+            "FECHA_PAGO", "PRORRATEO", "ESTATUS"
+        ])
+
+    out = pd.DataFrame({
+        "FECHA": df["FECHA"],
+        "CONCEPTO": get_first_series(df, "GENERAL"),
+        "TIPO": df["TIPO"],
+        "DEPARTAMENTO": get_first_series(df, "DEPARTAMENTO"),
+        "CLIENTE": get_first_series(df, "CLIENTE"),
+        "EMPRESA": get_first_series(df, "EMPRESA"),
+        "IMPORTE_PRON": df["IMPORTE_PRON"],
+        "IMPORTE_REAL": 0.0,
+        "NATURALEZA": get_first_series(df, "NATURALEZA"),
+        "PAGADO_BOOL": get_first_series(df, "PAGADO_BOOL").fillna(False).astype(bool),
+        "FECHA_PAGO": pd.NaT,
+        "PRORRATEO": "",
+    })
+
+    out = coalesce_cliente_empresa(out)
+
+    out["ESTATUS"] = out.apply(
+        lambda x: estado_cobro_pago(x.get("TIPO", ""), bool(x.get("PAGADO_BOOL", False))),
+        axis=1
+    )
+
+    return drop_duplicate_columns(out).sort_values("FECHA").reset_index(drop=True)
+
+
+# -----------------------------
+# Generador anterior mantenido solo por compatibilidad, pero ya NO se usa para PRON
+# -----------------------------
 def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
     end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
     rows = []
@@ -883,10 +969,26 @@ def build_real_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timesta
 
 def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amount_col: str) -> pd.DataFrame:
     df = drop_duplicate_columns(df.copy())
-    df["COBROS"] = df.apply(lambda x: x[amount_col] if x["TIPO"] == "INGRESO" else 0.0, axis=1)
-    df["PAGOS"] = df.apply(lambda x: x[amount_col] if x["TIPO"] == "GASTO" else 0.0, axis=1)
+
+    df["TIPO"] = get_first_series(df, "TIPO").astype(str).str.upper().str.strip()
+    df[amount_col] = pd.to_numeric(
+        get_first_series(df, amount_col),
+        errors="coerce"
+    ).fillna(0.0).abs()
+
+    df["COBROS"] = df.apply(
+        lambda x: x[amount_col] if x["TIPO"] == "INGRESO" else 0.0,
+        axis=1
+    )
+
+    df["PAGOS"] = df.apply(
+        lambda x: x[amount_col] if x["TIPO"] == "GASTO" else 0.0,
+        axis=1
+    )
+
     df["NETO"] = df["COBROS"] - df["PAGOS"]
     df["SALDO"] = starting_balance + df["NETO"].cumsum()
+
     return df
 
 
@@ -939,7 +1041,10 @@ except Exception as e:
 
 start_ts = pd.Timestamp(saldo_fecha).normalize()
 
-generated_pron = generate_events_from_catalog(
+# IMPORTANTE:
+# El pronóstico se calcula directamente desde FECHA CARGO GASTO + PREVISION.
+# Ya no se usa generate_events_from_catalog para la curva pronosticada.
+generated_pron = build_pron_events_direct_from_excel(
     catalog=catalog,
     start_date=start_ts,
     months_horizon=months_horizon
@@ -973,7 +1078,7 @@ if dedupe_exact and not generated_real.empty:
     )
 
 if generated_pron.empty and generated_real.empty:
-    st.warning("No se generaron movimientos.")
+    st.warning("No se generaron movimientos. Revisa que existan fechas en 'FECHA CARGO GASTO' e importes en 'PREVISION'.")
     st.dataframe(catalog.head(50), use_container_width=True)
     st.stop()
 
@@ -1011,6 +1116,20 @@ base_filtered_real = generated_real[
 
 base_filtered_pron = drop_duplicate_columns(base_filtered_pron)
 base_filtered_real = drop_duplicate_columns(base_filtered_real)
+
+# -----------------------------
+# Auditoría simple del pronóstico generado
+# -----------------------------
+with st.expander("Auditoría del pronóstico generado desde Excel"):
+    if generated_pron.empty:
+        st.warning("No hay movimientos pronosticados generados.")
+    else:
+        audit_pron = generated_pron.copy()
+        audit_pron["IMPORTE_PRON"] = pd.to_numeric(audit_pron["IMPORTE_PRON"], errors="coerce").fillna(0.0)
+        resumen_audit = audit_pron.groupby("TIPO", as_index=False)["IMPORTE_PRON"].sum()
+        resumen_audit = resumen_audit.rename(columns={"TIPO": "Tipo", "IMPORTE_PRON": "Total PREVISION usada"})
+        st.dataframe(resumen_audit.style.format({"Total PREVISION usada": eur}), use_container_width=True)
+        st.caption("Esta tabla muestra exactamente los importes que alimentan la curva Pronosticado.")
 
 # -----------------------------
 # Lógica tesorería
