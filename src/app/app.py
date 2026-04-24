@@ -652,7 +652,7 @@ def build_pron_events_direct_from_excel(
     No duplica meses.
     No interpreta reglas recurrentes.
     """
-    end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
+    end_date = (start_date + pd.offsets.MonthEnd(months_horizon)).normalize()
 
     df = drop_duplicate_columns(catalog.copy())
 
@@ -720,7 +720,7 @@ def build_pron_events_direct_from_excel(
 # Generador anterior mantenido solo por compatibilidad, pero ya NO se usa para PRON
 # -----------------------------
 def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
-    end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
+    end_date = (start_date + pd.offsets.MonthEnd(months_horizon)).normalize()
     rows = []
 
     for _, r in catalog.iterrows():
@@ -904,7 +904,7 @@ def generate_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp
 
 
 def build_real_events_from_catalog(catalog: pd.DataFrame, start_date: pd.Timestamp, months_horizon: int) -> pd.DataFrame:
-    end_date = (start_date + pd.offsets.MonthBegin(months_horizon + 1)).normalize()
+    end_date = (start_date + pd.offsets.MonthEnd(months_horizon)).normalize()
     rows = []
 
     for _, r in catalog.iterrows():
