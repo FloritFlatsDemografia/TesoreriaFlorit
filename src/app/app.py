@@ -992,6 +992,73 @@ def compute_balance_from_amount(df: pd.DataFrame, starting_balance: float, amoun
     return df
 
 
+def recalcular_saldo_base_historico(
+    catalog: pd.DataFrame,
+    saldo_actual: float,
+    fecha_base: pd.Timestamp,
+    fecha_real_saldo: pd.Timestamp
+) -> float:
+    """
+    Recalcula el saldo que había en una fecha anterior usando movimiento inverso.
+
+    Si el Excel de bancos contiene el saldo real actual, pero el usuario selecciona una
+    fecha de saldo anterior, no tiene sentido arrancar el gráfico con el saldo actual.
+
+    Fórmula:
+        saldo_en_fecha_base = saldo_actual - neto_real_entre_fecha_base_y_fecha_actual
+
+    Donde:
+        neto_real = ingresos reales - gastos reales
+    """
+    fecha_base = pd.Timestamp(fecha_base).normalize()
+    fecha_real_saldo = pd.Timestamp(fecha_real_saldo).normalize()
+
+    if fecha_base >= fecha_real_saldo:
+        return float(saldo_actual)
+
+    horizon_months = max(
+        1,
+        ((fecha_real_saldo.year - fecha_base.year) * 12)
+        + (fecha_real_saldo.month - fecha_base.month)
+        + 1
+    )
+
+    reales = build_real_events_from_catalog(
+        catalog=catalog,
+        start_date=fecha_base,
+        months_horizon=horizon_months
+    )
+
+    if reales.empty:
+        return float(saldo_actual)
+
+    reales = drop_duplicate_columns(reales.copy())
+    reales["FECHA"] = pd.to_datetime(get_first_series(reales, "FECHA"), errors="coerce").dt.normalize()
+    reales["TIPO"] = get_first_series(reales, "TIPO").astype(str).str.upper().str.strip()
+    reales["IMPORTE_REAL"] = pd.to_numeric(
+        get_first_series(reales, "IMPORTE_REAL"),
+        errors="coerce"
+    ).fillna(0.0).abs()
+
+    reales = reales[
+        (reales["FECHA"] > fecha_base) &
+        (reales["FECHA"] <= fecha_real_saldo) &
+        (reales["TIPO"].isin(["INGRESO", "GASTO"]))
+    ].copy()
+
+    if reales.empty:
+        return float(saldo_actual)
+
+    reales["NETO_REAL"] = reales.apply(
+        lambda r: r["IMPORTE_REAL"] if r["TIPO"] == "INGRESO" else -r["IMPORTE_REAL"],
+        axis=1
+    )
+
+    neto_entre_fechas = float(reales["NETO_REAL"].sum())
+
+    return float(saldo_actual) - neto_entre_fechas
+
+
 # -----------------------------
 # Inputs
 # -----------------------------
@@ -1021,7 +1088,7 @@ cuenta_suplidos = bancos.get("cuenta_suplidos")
 cuenta_efectivo = bancos.get("cuenta_efectivo")
 
 st.sidebar.header("Bancos (desde Excel)")
-st.sidebar.metric("Saldo inicial neto", eur(saldo_hoy))
+st.sidebar.metric("Saldo bancos Excel", eur(saldo_hoy))
 st.sidebar.metric("TOTAL CTAS", eur(total_ctas))
 st.sidebar.metric("TOTAL DISPUESTO", eur(total_dispuesto))
 st.sidebar.metric("TOTAL PÓLIZAS", eur(total_polizas))
@@ -1040,6 +1107,32 @@ except Exception as e:
     st.stop()
 
 start_ts = pd.Timestamp(saldo_fecha).normalize()
+fecha_real_saldo_bancos = pd.Timestamp(date.today()).normalize()
+
+# -----------------------------
+# Saldo base coherente con la fecha seleccionada
+# -----------------------------
+# Si el usuario selecciona una fecha anterior a hoy, reconstruimos el saldo inicial
+# de esa fecha usando movimiento inverso sobre los movimientos reales ejecutados.
+saldo_base = recalcular_saldo_base_historico(
+    catalog=catalog,
+    saldo_actual=saldo_hoy,
+    fecha_base=start_ts,
+    fecha_real_saldo=fecha_real_saldo_bancos
+)
+
+if start_ts < fecha_real_saldo_bancos:
+    st.sidebar.warning(
+        "Saldo base recalculado hacia atrás usando movimientos reales ejecutados."
+    )
+    st.sidebar.metric("Saldo recalculado en fecha seleccionada", eur(saldo_base))
+elif start_ts > fecha_real_saldo_bancos:
+    st.sidebar.warning(
+        "Has seleccionado una fecha futura como fecha de saldo. Se usa el saldo del Excel sin recalcular."
+    )
+    saldo_base = saldo_hoy
+else:
+    saldo_base = saldo_hoy
 
 # IMPORTANTE:
 # El pronóstico se calcula directamente desde FECHA CARGO GASTO + PREVISION.
@@ -1158,9 +1251,9 @@ if "ESTATUS" not in real_df.columns:
 
 real_df = drop_duplicate_columns(real_df).sort_values("FECHA").reset_index(drop=True)
 
-consolidado_pron = compute_balance_from_amount(pron_df, saldo_hoy, "IMPORTE_PRON") if not pron_df.empty else pron_df.copy()
-consolidado_pron_pend = compute_balance_from_amount(pron_pendientes_df, saldo_hoy, "IMPORTE_PRON") if not pron_pendientes_df.empty else pron_pendientes_df.copy()
-consolidado_real = compute_balance_from_amount(real_df, saldo_hoy, "IMPORTE_REAL") if not real_df.empty else real_df.copy()
+consolidado_pron = compute_balance_from_amount(pron_df, saldo_base, "IMPORTE_PRON") if not pron_df.empty else pron_df.copy()
+consolidado_pron_pend = compute_balance_from_amount(pron_pendientes_df, saldo_base, "IMPORTE_PRON") if not pron_pendientes_df.empty else pron_pendientes_df.copy()
+consolidado_real = compute_balance_from_amount(real_df, saldo_base, "IMPORTE_REAL") if not real_df.empty else real_df.copy()
 
 if not consolidado_pron.empty and "ESTATUS" not in consolidado_pron.columns:
     consolidado_pron["ESTATUS"] = consolidado_pron.apply(
@@ -1197,7 +1290,7 @@ base_row = pd.DataFrame([{
     "COBROS": 0.0,
     "PAGOS": 0.0,
     "NETO": 0.0,
-    "SALDO": saldo_hoy
+    "SALDO": saldo_base
 }])
 
 consolidado_pron2 = pd.concat([base_row, consolidado_pron], ignore_index=True) if not consolidado_pron.empty else base_row.copy()
@@ -1273,8 +1366,8 @@ view_real = view_real[get_first_series(view_real, "ESTATUS").isin(["PAGADO", "CO
 # -----------------------------
 fecha_objetivo = pd.Timestamp(d_to).normalize()
 
-saldo_pron_obj = get_saldo_en_fecha(consolidado_pron2, fecha_objetivo, saldo_hoy)
-saldo_real_obj = get_saldo_en_fecha(consolidado_real2, fecha_objetivo, saldo_hoy)
+saldo_pron_obj = get_saldo_en_fecha(consolidado_pron2, fecha_objetivo, saldo_base)
+saldo_real_obj = get_saldo_en_fecha(consolidado_real2, fecha_objetivo, saldo_base)
 
 gap = saldo_real_obj - saldo_pron_obj
 gap_pct = safe_deviation_pct(saldo_real_obj, saldo_pron_obj)
@@ -1287,7 +1380,7 @@ if not pron_pendientes_df.empty:
         pd.to_datetime(get_first_series(pron_pendientes_df, "FECHA"), errors="coerce").dt.normalize() <= fecha_objetivo
     ].copy()
     if not pron_hasta_obj.empty:
-        pron_hasta_obj = compute_balance_from_amount(pron_hasta_obj, saldo_hoy, "IMPORTE_PRON")
+        pron_hasta_obj = compute_balance_from_amount(pron_hasta_obj, saldo_base, "IMPORTE_PRON")
         pagos_pendientes_hasta = float(get_first_series(pron_hasta_obj, "PAGOS").sum())
         cobros_pendientes_hasta = float(get_first_series(pron_hasta_obj, "COBROS").sum())
 
@@ -1296,7 +1389,7 @@ gastos_alerta = get_gastos_relevantes(pron_pendientes_df, start_ts, dias=30, umb
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 
 with c1:
-    st.metric("Saldo hoy", eur(saldo_hoy))
+    st.metric("Saldo base gráfico", eur(saldo_base))
 with c2:
     st.metric(f"Previsto al {fecha_objetivo.strftime('%d-%m-%Y')}", eur(saldo_pron_obj))
 with c3:
@@ -1358,8 +1451,8 @@ daily = pd.merge(d_pron, d_real, on="FECHA", how="outer").sort_values("FECHA")
 
 all_days = pd.date_range(start=daily["FECHA"].min(), end=daily["FECHA"].max(), freq="D")
 daily = daily.set_index("FECHA").reindex(all_days).rename_axis("FECHA").reset_index()
-daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(saldo_hoy)
-daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(saldo_hoy)
+daily["SALDO_PRON"] = daily["SALDO_PRON"].ffill().fillna(saldo_base)
+daily["SALDO_REAL"] = daily["SALDO_REAL"].ffill().fillna(saldo_base)
 
 daily["DESVIACION"] = daily["SALDO_REAL"] - daily["SALDO_PRON"]
 daily["AREA_POS_TOP"] = daily[["SALDO_REAL", "SALDO_PRON"]].max(axis=1)
