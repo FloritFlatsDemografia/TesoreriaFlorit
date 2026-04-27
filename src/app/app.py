@@ -1063,7 +1063,11 @@ def recalcular_saldo_base_historico(
 # Inputs
 # -----------------------------
 st.sidebar.header("Inputs")
-saldo_fecha = st.sidebar.date_input("Fecha del saldo (hoy)", value=date.today())
+saldo_fecha = st.sidebar.date_input(
+    "Fecha del saldo",
+    value=date.today(),
+    format="DD/MM/YYYY"
+)
 months_horizon = st.sidebar.slider("Horizonte forecast (meses)", min_value=1, max_value=36, value=12)
 dedupe_exact = st.sidebar.checkbox("Eliminar duplicados exactos (red de seguridad)", value=True)
 uploaded = st.sidebar.file_uploader("Sube el Excel de catálogo (xlsx)", type=["xlsx"])
@@ -1329,7 +1333,8 @@ date_range = st.sidebar.date_input(
     "Rango de fechas",
     value=(min_d, max_d),
     min_value=min_d,
-    max_value=max_d
+    max_value=max_d,
+    format="DD/MM/YYYY"
 )
 
 if isinstance(date_range, tuple) and len(date_range) == 2:
